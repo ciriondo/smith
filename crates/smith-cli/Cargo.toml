@@ -1,0 +1,21 @@
+[package]
+name = "smith-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "smith"
+path = "src/main.rs"
+
+[dependencies]
+smith-core.workspace = true
+smith-providers.workspace = true
+smith-web.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

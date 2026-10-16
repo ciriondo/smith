@@ -1,0 +1,826 @@
+//! smith: a barebones coding agent.
+//!
+//! The terminal frontend. It is a renderer: it sends [`Command`]s to a session and prints the
+//! [`UiEvent`]s it receives. It holds no conversation state. The same session layer supports
+//! the web server.
+
+use std::io::{IsTerminal, Write};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use clap::{Args, Parser, Subcommand};
+
+use smith_core::config::Config;
+use smith_core::session::{SessionConfig, SessionHandle, SessionManager, SubError, Subscription};
+use smith_core::{SmithError, UiEventKind};
+
+/// Exit codes. `-p` mode is used by scripts, so these values are part of the contract.
+const EXIT_OK: u8 = 0;
+const EXIT_FAILED: u8 = 1;
+const EXIT_CANCELLED: u8 = 130;
+
+#[derive(Parser, Debug)]
+#[command(name = "smith", version, about = "a barebones coding agent")]
+struct Cli {
+    /// Run one prompt headlessly, print the reply, and exit.
+    #[arg(short = 'p', long = "print", value_name = "PROMPT")]
+    print: Option<String>,
+
+    /// Model to use, as `provider/model` or a bare model id.
+    #[arg(short = 'm', long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// Config file to load instead of the built-in defaults.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// System prompt.
+    #[arg(long, value_name = "PROMPT")]
+    system: Option<String>,
+
+    /// Print reasoning tokens (providers that emit them) to stderr.
+    #[arg(long)]
+    show_reasoning: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Inspect configured providers and models.
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
+
+    /// Serve the web UI on localhost: the same sessions, rendered in a browser.
+    Serve(ServeArgs),
+}
+
+/// `smith serve` flags. `bind` and `port` are optional so the config file's `[serve]` section
+/// can supply them. A flag overrides the config, and the config overrides the built-in default.
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Address to bind. Loopback only: anything else is refused.
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<String>,
+
+    /// Port to bind. 0 asks the operating system to choose one.
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
+
+    /// Attach this terminal to the same sessions, so one run can be watched in a terminal and
+    /// a browser at once. Off by default, so `smith serve` can run as a background process.
+    #[arg(long)]
+    repl: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvidersCommand {
+    /// List providers and the models smith will advertise for each.
+    List,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("smith: failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> ExitCode {
+    let config = match Config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match cli.command {
+        Some(Command::Providers {
+            command: ProvidersCommand::List,
+        }) => {
+            list_providers(&config);
+            return ExitCode::SUCCESS;
+        }
+        Some(Command::Serve(args)) => {
+            return serve(
+                &config,
+                cli.model.as_deref(),
+                cli.system.clone(),
+                args,
+                cli.show_reasoning,
+            )
+            .await
+        }
+        None => {}
+    }
+
+    let manager = match build_manager(&config, cli.model.as_deref(), cli.system.clone()) {
+        Ok(manager) => manager,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // One session for the entire process, so the conversation accumulates across REPL turns.
+    // The session id is also the provider's conversation id.
+    let session = manager.create();
+    let show_reasoning = cli.show_reasoning;
+
+    // One listener covers both modes: Ctrl-C cancels the running turn rather than the
+    // process, and the session ignores a cancel when nothing is running.
+    watch_ctrl_c(&session);
+
+    match cli.print {
+        Some(prompt) => {
+            let code = prompt_and_render(&session, prompt, show_reasoning).await;
+            ExitCode::from(code)
+        }
+        None => repl(&session, show_reasoning).await,
+    }
+}
+
+/// Resolve the provider, model and system prompt into a `SessionManager`.
+fn build_manager(
+    config: &Config,
+    model_flag: Option<&str>,
+    system_flag: Option<String>,
+) -> Result<SessionManager, SmithError> {
+    let model_spec = model_flag.unwrap_or(&config.model);
+    let model = config.resolve_model(model_spec)?;
+    let provider_cfg = config.provider(&model.provider)?;
+    let provider = smith_providers::build(&model.provider, provider_cfg)?;
+
+    Ok(SessionManager::new(SessionConfig {
+        provider,
+        model: model.model,
+        system: system_flag.or_else(|| config.system_prompt.clone()),
+        // Tools are not implemented, so this list stays empty.
+        tools: Vec::new(),
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+    }))
+}
+
+/// Run the web frontend: the same core rendered in a browser instead of a terminal.
+async fn serve(
+    config: &Config,
+    model_flag: Option<&str>,
+    system_flag: Option<String>,
+    args: ServeArgs,
+    show_reasoning: bool,
+) -> ExitCode {
+    // Precedence, highest first: the flag, the `[serve]` section, the built-in default.
+    let bind: IpAddr = match args.bind.as_deref() {
+        Some(text) => match text.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                eprintln!("smith: --bind expects an IP address, not '{text}'");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => config.serve.bind,
+    };
+    let port = args.port.unwrap_or(config.serve.port);
+
+    // The bind check runs first: a routable address is a security error, and reporting it
+    // before any provider request keeps the failure local. `smith_web::bind` checks it again
+    // so the rule holds for every caller.
+    if let Err(e) = smith_web::ensure_loopback(bind) {
+        eprintln!("smith: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let manager = match build_manager(config, model_flag, system_flag) {
+        Ok(manager) => manager,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Shared rather than moved: with `--repl`, the terminal holds a session handle from the
+    // same set the browser uses.
+    let manager = Arc::new(manager);
+
+    let bound = match smith_web::bind(smith_web::ServerConfig {
+        sessions: manager.clone(),
+        bind,
+        port,
+        token: smith_web::new_token(),
+    })
+    .await
+    {
+        Ok(bound) => bound,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if args.repl {
+        attach_repl(&manager.create(), show_reasoning);
+    }
+
+    match smith_web::serve(bound).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Attach a terminal frontend to the session manager the server uses.
+///
+/// The session outlives the terminal: `--repl` adds a frontend to a server, so reaching
+/// end-of-input stops reading input rather than shutting the server down.
+fn attach_repl(session: &SessionHandle, show_reasoning: bool) {
+    eprintln!(
+        "smith: terminal attached to session {}. It is also in the browser's session list.",
+        session.id()
+    );
+    watch_ctrl_c_stopping_when_idle(session);
+
+    let session = session.clone();
+    tokio::spawn(async move {
+        repl(&session, show_reasoning).await;
+        eprintln!("smith: terminal detached. The server is still listening.");
+    });
+}
+
+fn list_providers(config: &Config) {
+    for (id, cfg) in &config.providers {
+        let default = if *id == config.default_provider {
+            " (default)"
+        } else {
+            ""
+        };
+        println!("{id}{default}");
+        println!("  endpoint: {}", cfg.base_url);
+        println!("  api key:  ${}", cfg.api_key_env);
+        for model in &cfg.models {
+            let star = if *model == cfg.default_model {
+                "*"
+            } else {
+                " "
+            };
+            println!("  {star} {id}/{model}");
+        }
+    }
+}
+
+/// Send one prompt and render the turn it starts.
+async fn prompt_and_render(session: &SessionHandle, prompt: String, show_reasoning: bool) -> u8 {
+    // Subscribe before snapshotting, and snapshot before sending: a subscription is a live
+    // view, so one created afterwards would miss what had already been emitted, and the
+    // snapshot is what marks the turn that follows as this frontend's own.
+    let mut subscription = session.subscribe();
+    let since = match session.snapshot().await {
+        Ok(snapshot) => snapshot.seq,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return EXIT_FAILED;
+        }
+    };
+
+    let sent = session.send(prompt.clone()).await;
+    if let Err(e) = sent {
+        eprintln!("smith: {e}");
+        return EXIT_FAILED;
+    }
+
+    render_turn(
+        &mut subscription,
+        &prompt,
+        since,
+        show_reasoning,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+/// Render a turn's events until it ends, returning the exit code for it.
+///
+/// `prompt` and `since` identify the turn. Events with `seq` at or below `since` belong to an
+/// earlier turn or another frontend and are skipped. Rendering them would print another
+/// frontend's reply next to this prompt, and their terminal event would end this loop before
+/// the reply to this prompt arrives.
+///
+/// The writers are parameters rather than `stdout` and `stderr`, so tests can check the output
+/// and exit codes. See the tests at the bottom of this file.
+async fn render_turn<W: Write, E: Write>(
+    subscription: &mut Subscription,
+    prompt: &str,
+    since: u64,
+    show_reasoning: bool,
+    out: &mut W,
+    err: &mut E,
+) -> u8 {
+    let mut streamed_any = false;
+    let mut reasoning_shown = false;
+
+    loop {
+        let event = match subscription.recv().await {
+            Ok(event) => event,
+            // The transcript arrives complete with `TurnFinished`, so a lag costs display, not
+            // correctness. Report the gap rather than printing silently.
+            Err(SubError::Lagged(n)) => {
+                let _ = writeln!(
+                    err,
+                    "smith: fell {n} events behind. Some output was skipped."
+                );
+                continue;
+            }
+            Err(SubError::Closed) => {
+                let _ = writeln!(err, "smith: the session stopped unexpectedly");
+                return EXIT_FAILED;
+            }
+        };
+
+        if event.seq <= since {
+            continue;
+        }
+
+        match event.kind {
+            UiEventKind::TextDelta { text } => {
+                let _ = write!(out, "{text}");
+                let _ = out.flush();
+                streamed_any = true;
+            }
+            UiEventKind::ReasoningDelta { text } if show_reasoning => {
+                if !reasoning_shown {
+                    let _ = write!(err, "\x1b[2m");
+                    reasoning_shown = true;
+                }
+                let _ = write!(err, "{text}");
+            }
+            // Reasoning is not part of the reply. It is hidden unless asked for.
+            UiEventKind::ReasoningDelta { .. } => {}
+            UiEventKind::TurnFinished {
+                usage,
+                tool_arg_errors,
+                ..
+            } => {
+                if reasoning_shown {
+                    let _ = write!(err, "\x1b[0m");
+                }
+                if streamed_any {
+                    let _ = writeln!(out);
+                }
+                for failure in &tool_arg_errors {
+                    let _ = writeln!(
+                        err,
+                        "smith: model sent unparseable arguments for {}: {}",
+                        failure.tool, failure.message
+                    );
+                }
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    let _ = writeln!(
+                        err,
+                        "smith: {} in / {} out tokens",
+                        usage.input_tokens, usage.output_tokens
+                    );
+                }
+                let _ = out.flush();
+                let _ = err.flush();
+                return EXIT_OK;
+            }
+            UiEventKind::TurnFailed { message } => {
+                if reasoning_shown {
+                    let _ = write!(err, "\x1b[0m");
+                }
+                if streamed_any {
+                    let _ = writeln!(out);
+                }
+                let _ = writeln!(err, "smith: {message}");
+                let _ = out.flush();
+                let _ = err.flush();
+                return EXIT_FAILED;
+            }
+            UiEventKind::Cancelled => {
+                if reasoning_shown {
+                    let _ = write!(err, "\x1b[0m");
+                }
+                if streamed_any {
+                    let _ = writeln!(out);
+                }
+                let _ = writeln!(err, "smith: cancelled");
+                let _ = out.flush();
+                let _ = err.flush();
+                return EXIT_CANCELLED;
+            }
+            // This frontend's prompt was refused because another frontend started a turn
+            // first. Return because this turn will not happen. Waiting would hang, since the
+            // reply was never requested.
+            UiEventKind::SendRejected { prompt: rejected } if rejected == prompt => {
+                let _ = writeln!(
+                    err,
+                    "smith: a turn is already running. {rejected:?} was dropped."
+                );
+                let _ = out.flush();
+                let _ = err.flush();
+                return EXIT_FAILED;
+            }
+            // Another frontend's prompt was refused. Report it because the turn it belongs to
+            // is unaffected.
+            UiEventKind::SendRejected { prompt: rejected } => {
+                let _ = writeln!(
+                    err,
+                    "smith: another frontend sent {rejected:?} while a turn was running"
+                );
+            }
+            UiEventKind::TurnStarted { .. } | UiEventKind::Usage { .. } => {}
+        }
+    }
+}
+
+async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let interactive = std::io::stdin().is_terminal();
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut subscription = session.subscribe();
+
+    loop {
+        if interactive {
+            print!("> ");
+            let _ = std::io::stdout().flush();
+        }
+
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("smith: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let prompt = line.trim();
+        if prompt.is_empty() {
+            continue;
+        }
+        if prompt == "/exit" || prompt == "/quit" {
+            return ExitCode::SUCCESS;
+        }
+
+        // Snapshot before sending, so the reply rendered next is this prompt's and not
+        // something another frontend started in the meantime.
+        let since = match session.snapshot().await {
+            Ok(snapshot) => snapshot.seq,
+            Err(e) => {
+                eprintln!("smith: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = session.send(prompt.to_string()).await {
+            eprintln!("smith: {e}");
+            return ExitCode::FAILURE;
+        }
+
+        // A failed or cancelled turn never entered the transcript, so there is nothing to
+        // undo here. The session enforces that rule, not the REPL.
+        let _ = render_turn(
+            &mut subscription,
+            prompt,
+            since,
+            show_reasoning,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await;
+    }
+}
+
+/// Ctrl-C cancels the running turn instead of the process, so a long reply can be abandoned
+/// without losing the conversation. One listener covers the entire process, and the session
+/// ignores a cancel when nothing is running.
+fn watch_ctrl_c(session: &SessionHandle) {
+    let session = session.clone();
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            let _ = session.cancel().await;
+        }
+    });
+}
+
+/// Ctrl-C while a terminal is attached to a server: cancel the running turn, and stop the
+/// process when nothing is running.
+///
+/// The plain REPL does not exit on Ctrl-C because the key cancels a reply. In the `--repl`
+/// case that would leave no way to stop the server from the terminal it was started in.
+fn watch_ctrl_c_stopping_when_idle(session: &SessionHandle) {
+    let session = session.clone();
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            if session.is_busy() {
+                let _ = session.cancel().await;
+            } else {
+                std::process::exit(i32::from(EXIT_OK));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use smith_core::message::StopReason;
+    use smith_core::message::Usage;
+    use smith_core::mock::MockProvider;
+    use smith_core::provider::ProviderEvent;
+
+    fn session_running(provider: Arc<MockProvider>) -> SessionHandle {
+        SessionManager::new(SessionConfig {
+            provider,
+            model: "mock-1".to_string(),
+            system: None,
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+        })
+        .create()
+    }
+
+    /// Render one turn and return the exit code and the output written to each stream.
+    ///
+    /// The subscription is the caller's, as it is for a real frontend. A subscription is a
+    /// view of the session from its creation point, so the REPL keeps one for the process
+    /// rather than making a fresh one per prompt, which would replay earlier turns.
+    async fn run_turn_rendered(
+        session: &SessionHandle,
+        subscription: &mut Subscription,
+        show_reasoning: bool,
+        cancel_after: Option<Duration>,
+    ) -> (u8, String, String) {
+        // Exactly what the REPL does: snapshot, send, then render only what followed.
+        let since = session.snapshot().await.unwrap().seq;
+        session.send("go").await.unwrap();
+
+        if let Some(delay) = cancel_after {
+            let session = session.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = session.cancel().await;
+            });
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = render_turn(
+            subscription,
+            "go",
+            since,
+            show_reasoning,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    /// This test pins the streaming contract: the reply on stdout with one trailing newline,
+    /// diagnostics on stderr, exit code 0.
+    #[tokio::test]
+    async fn a_finished_turn_prints_the_reply_then_the_usage_line() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::TextDelta("Hel".to_string()),
+            ProviderEvent::TextDelta("lo".to_string()),
+            ProviderEvent::Usage(Usage {
+                input_tokens: 19,
+                output_tokens: 17,
+            }),
+            ProviderEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+
+        let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "Hello\n");
+        assert_eq!(err, "smith: 19 in / 17 out tokens\n");
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_hidden_unless_asked_for() {
+        let script = || {
+            vec![
+                ProviderEvent::ReasoningDelta("thinking".to_string()),
+                ProviderEvent::TextDelta("answer".to_string()),
+                ProviderEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ]
+        };
+
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(script());
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+        let (_, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(out, "answer\n");
+        assert_eq!(err, "", "reasoning must not leak into stderr by default");
+
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(script());
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+        let (_, out, err) = run_turn_rendered(&session, &mut subscription, true, None).await;
+        assert_eq!(out, "answer\n");
+        assert_eq!(err, "\x1b[2mthinking\x1b[0m", "dimmed, then reset");
+    }
+
+    /// Exit code 130, and the cancelled turn is dropped from the transcript: the next request
+    /// contains only the follow-up prompt.
+    #[tokio::test]
+    async fn ctrl_c_cancels_the_turn_without_leaving_it_in_the_transcript() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_stalling_text("half an ans");
+        provider.push_text("recovered");
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+
+        let (code, out, err) = run_turn_rendered(
+            &session,
+            &mut subscription,
+            false,
+            Some(Duration::from_millis(20)),
+        )
+        .await;
+        assert_eq!(code, EXIT_CANCELLED);
+        assert_eq!(out, "half an ans\n", "partial output is still flushed");
+        assert_eq!(err, "smith: cancelled\n");
+
+        // The session survives and is usable.
+        let (code, out, _) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "recovered\n");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].messages.len(),
+            1,
+            "the cancelled turn must not appear in the next request"
+        );
+        assert_eq!(requests[1].messages[0].text(), "go");
+    }
+
+    /// With two frontends on one session, the terminal must render the turn it started.
+    ///
+    /// A queued event from another frontend must not end this frontend's render loop before
+    /// the reply to its own prompt arrives.
+    #[tokio::test]
+    async fn a_turn_from_another_frontend_is_not_rendered_as_this_ones_reply() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_text("theirs");
+        provider.push_text("mine");
+        let session = session_running(provider);
+
+        // The terminal's view and a second frontend that sends first.
+        let mut terminal = session.subscribe();
+        let mut other_frontend = session.subscribe();
+
+        session.send("theirs").await.unwrap();
+        loop {
+            if matches!(
+                other_frontend.recv().await.unwrap().kind,
+                UiEventKind::TurnFinished { .. }
+            ) {
+                break;
+            }
+        }
+
+        // The terminal sends now. Its queued backlog already holds the other turn.
+        let since = session.snapshot().await.unwrap().seq;
+        session.send("go").await.unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = render_turn(&mut terminal, "go", since, false, &mut out, &mut err).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "mine\n",
+            "the other frontend's reply must not be rendered as this prompt's answer"
+        );
+        assert_eq!(String::from_utf8(err).unwrap(), "");
+
+        // Both turns are in the transcript, which the two frontends share.
+        let transcript = session.snapshot().await.unwrap().transcript;
+        assert_eq!(transcript.len(), 4);
+        assert_eq!(transcript[3].text(), "mine");
+    }
+
+    /// A prompt is refused because another frontend's turn is running. The reply it waits for
+    /// is never requested, so waiting would hang. The frontend must fail instead.
+    #[tokio::test]
+    async fn a_prompt_rejected_while_another_turn_runs_fails_instead_of_waiting() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_stalling_text("working");
+        let session = session_running(provider);
+
+        let mut terminal = session.subscribe();
+        let mut other_frontend = session.subscribe();
+
+        session.send("first").await.unwrap();
+        // Wait until the turn is in flight before sending.
+        loop {
+            if let UiEventKind::TextDelta { .. } = other_frontend.recv().await.unwrap().kind {
+                break;
+            }
+        }
+
+        let since = session.snapshot().await.unwrap().seq;
+        session.send("go").await.unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            render_turn(&mut terminal, "go", since, false, &mut out, &mut err),
+        )
+        .await
+        .expect("a rejected prompt must not leave the frontend waiting");
+
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(String::from_utf8(out).unwrap(), "");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("a turn is already running"), "{err}");
+        assert!(
+            err.contains("\"go\""),
+            "it must name the dropped prompt: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_is_exit_1_with_the_reason_on_stderr() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_error(smith_core::ProviderError::Transport {
+            provider: "mock".to_string(),
+            message: "connection reset".to_string(),
+        });
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+
+        let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(out, "", "no reply to print");
+        assert!(err.starts_with("smith: transport failure"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unparseable_tool_arguments_are_reported_but_the_turn_still_succeeds() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("read_file".to_string()),
+                args_delta: "{\"path\": \"/etc".to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        let session = session_running(provider.clone());
+        let mut subscription = session.subscribe();
+
+        let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "");
+        assert!(
+            err.contains("unparseable arguments for read_file"),
+            "the loop reports what the model got wrong: {err}"
+        );
+    }
+}

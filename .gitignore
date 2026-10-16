@@ -1,0 +1,6 @@
+# Build output.
+/target
+
+# Design documents are local working notes, deliberately untracked. Nothing in the tracked
+# tree refers to them, so a clone is self-contained.
+/plans/

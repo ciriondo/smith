@@ -1,0 +1,19 @@
+# The toolchain this project requires.
+#
+# The dependency graph contains manifests that require `edition2024` (clap_derive,
+# hyper-util). Ubuntu's rustc/cargo 1.75 in /usr/bin cannot parse them; the failure appears
+# as a lock-file version error:
+#
+#     error: failed to parse lock file at: .../Cargo.lock
+#     Caused by: lock file version 4 requires `-Znext-lockfile-bump`
+#
+# The lock file is not the cause, and downgrading it moves the failure one step later. A
+# current stable toolchain is required. rustup provides one on this machine.
+#
+# rustup's cargo shim reads this file and uses the channel below, overriding the rustup
+# default. Measured with rustc 1.99.1.
+[toolchain]
+channel = "stable"
+# `cargo fmt` and `cargo clippy` are part of how this project is checked, so they are not
+# optional here even though the rustup profile is minimal.
+components = ["rustfmt", "clippy"]

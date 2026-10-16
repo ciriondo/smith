@@ -1,0 +1,111 @@
+:root {
+  --fg: #d8dee9;
+  --dim: #7b8794;
+  --bg: #14181f;
+  --panel: #1b202a;
+  --line: #2b3240;
+  --accent: #7aa2f7;
+  --warn: #e0af68;
+  --error: #f7768e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 16rem 1fr;
+  height: 100vh;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#sidebar {
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  padding: 1rem;
+  overflow-y: auto;
+}
+
+#sidebar h1 { margin: 0 0 1rem; font-size: 1rem; letter-spacing: 0.1em; }
+
+#sessions { list-style: none; margin: 1rem 0 0; padding: 0; }
+#sessions button {
+  width: 100%;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#sessions .selected button { border-color: var(--accent); color: var(--accent); }
+
+button {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }
+
+#main { display: flex; flex-direction: column; min-height: 0; }
+
+#header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: 1rem;
+  list-style: none;
+}
+
+.message { margin-bottom: 1rem; }
+.message .who {
+  display: block;
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+}
+.message.user .body { color: var(--accent); }
+.message .body { white-space: pre-wrap; word-wrap: break-word; }
+
+.note {
+  color: var(--dim);
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+#composer {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--line);
+}
+#input {
+  flex: 1;
+  resize: vertical;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.5rem;
+  font: inherit;
+}
+
+.status { font-size: 0.8rem; color: var(--dim); }
+.status.ok { color: var(--accent); }
+.status.warn { color: var(--warn); }
+.status.error { color: var(--error); }
+.muted { color: var(--dim); }

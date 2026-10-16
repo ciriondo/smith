@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smith</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<aside id="sidebar">
+  <h1>smith</h1>
+  <button id="new-session">New session</button>
+  <ul id="sessions"></ul>
+  <p id="status" class="status">connecting…</p>
+</aside>
+
+<main id="main">
+  <header id="header">
+    <span id="session-id" class="muted">no session selected</span>
+    <button id="cancel" disabled>Cancel</button>
+  </header>
+
+  <ol id="transcript"></ol>
+
+  <form id="composer">
+    <textarea id="input" rows="2" placeholder="Ask smith… (Enter to send, Shift+Enter for a newline)"></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

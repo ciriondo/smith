@@ -1,0 +1,19 @@
+[package]
+name = "smith-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate must stay free of network, TTY and HTTP crates: `cargo tree -p smith-core` must
+# not show reqwest/axum/clap.
+[dependencies]
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true
