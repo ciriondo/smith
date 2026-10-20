@@ -38,6 +38,7 @@ const sessionIdLabel = el("session-id");
 let currentSession = null;
 let lastSeq = 0;
 let streaming = false;
+let pauseRequested = false;
 let reconnectDelay = 500;
 
 async function api(path, options = {}) {
@@ -97,10 +98,23 @@ function renderTranscript(messages) {
   }
 }
 
+function setPauseRequested(value) {
+  pauseRequested = value;
+  const button = el("stop");
+  button.textContent = value ? "Terminate" : "Pause";
+  button.setAttribute(
+    "aria-label",
+    value
+      ? "Terminate the running turn (Esc Esc)"
+      : "Pause after the current step (Esc)",
+  );
+}
+
 function setBusy(busy) {
   streaming = busy;
   el("send").disabled = busy;
-  el("cancel").disabled = !busy;
+  el("stop").disabled = !busy;
+  if (!busy) setPauseRequested(false);
 }
 
 // --- sessions --------------------------------------------------------------
@@ -220,6 +234,7 @@ function apply(frame) {
 
   switch (frame.event) {
     case "turn_started":
+      setPauseRequested(false);
       setBusy(true);
       openReply = addMessage("assistant", "");
       break;
@@ -230,6 +245,23 @@ function apply(frame) {
       break;
     case "reasoning_delta":
       say("thinking…", "ok");
+      break;
+    case "pause_requested":
+      setPauseRequested(true);
+      say("pausing…", "warn");
+      break;
+    case "turn_paused":
+      setBusy(false);
+      openReply = null;
+      if (payload.usage && (payload.usage.input_tokens || payload.usage.output_tokens)) {
+        addNote(`${payload.usage.input_tokens} in / ${payload.usage.output_tokens} out tokens`);
+      }
+      for (const failure of payload.tool_arg_errors || []) {
+        addNote(`unparseable arguments for ${failure.tool}: ${failure.message}`);
+      }
+      addNote("paused after the current step. Send a message to steer.");
+      say("paused", "warn");
+      refreshSessions();
       break;
     case "turn_finished":
       setBusy(false);
@@ -242,6 +274,12 @@ function apply(frame) {
       }
       say("connected", "ok");
       refreshSessions();
+      break;
+    case "tool_started":
+      say(payload.summary, "ok");
+      break;
+    case "tool_finished":
+      addNote(`tool ${payload.name}: ${payload.summary} (${payload.duration_ms} ms)`);
       break;
     case "turn_failed":
       setBusy(false);
@@ -273,12 +311,35 @@ function apply(frame) {
 
 el("new-session").onclick = () => createSession().catch((e) => say(e.message, "error"));
 
-el("cancel").onclick = () => {
+async function stopAction() {
+  if (!streaming || !currentSession) return;
   const id = currentSession;
-  api(`/api/sessions/${encodeURIComponent(id)}/cancel`, { method: "POST" }).catch((e) =>
-    say(e.message, "error"),
-  );
-};
+  if (!pauseRequested) {
+    setPauseRequested(true);
+    try {
+      await api(`/api/sessions/${encodeURIComponent(id)}/pause`, { method: "POST" });
+      say("pausing…", "warn");
+    } catch (error) {
+      setPauseRequested(false);
+      say(error.message, "error");
+    }
+    return;
+  }
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+    say("terminating…", "warn");
+  } catch (error) {
+    say(error.message, "error");
+  }
+}
+
+el("stop").onclick = () => stopAction();
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || event.repeat || !streaming) return;
+  event.preventDefault();
+  stopAction();
+});
 
 el("composer").onsubmit = async (event) => {
   event.preventDefault();
@@ -292,6 +353,7 @@ el("composer").onsubmit = async (event) => {
       method: "POST",
       body: JSON.stringify({ text }),
     });
+    setBusy(true);
   } catch (error) {
     say(error.message, "error");
     addNote(error.message);

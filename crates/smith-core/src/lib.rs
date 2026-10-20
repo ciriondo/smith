@@ -12,11 +12,13 @@ pub mod message;
 pub mod mock;
 pub mod provider;
 pub mod session;
+pub mod tools;
 
 pub use error::{ProviderError, SmithError};
 pub use message::{ContentBlock, Message, Role, StopReason, Usage};
 pub use provider::{ChatRequest, ModelInfo, Provider, ProviderEvent, ProviderStream, ToolSpec};
 pub use session::{
-    Command, SessionConfig, SessionHandle, SessionId, SessionManager, SessionSnapshot, UiEvent,
-    UiEventKind,
+    Command, SessionConfig, SessionHandle, SessionId, SessionManager, SessionSnapshot, ToolSet,
+    UiEvent, UiEventKind,
 };
+pub use tools::{Tool, ToolContext, ToolError};

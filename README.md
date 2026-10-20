@@ -8,14 +8,14 @@ CLI and a localhost web server over a pluggable LLM provider layer.
 ## Status: early
 
 smith is a streaming client with a provider abstraction, a multi-turn REPL and a browser
-frontend over the same session layer. It is not yet an agent: it has no tools and cannot read,
-write or execute anything.
+frontend over the same session layer. Its tools run inside a podman container that has no
+network interface, a read-only root filesystem and explicit mounts.
 
 | | |
 |---|---|
-| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions) |
-| **Not yet** | Tools (`read_file`, `write_file`, `edit_file`, `run_shell`), session persistence across restarts |
-| **Milestones** | M0/M1 (core, CLI) and M4 (web) done; M2 (tools) is next |
+| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file` and `run_shell` in a sandbox |
+| **Not yet** | Session persistence across restarts; resource limits; the vendored podman fallback |
+| **Milestones** | M0/M1 (core, CLI), M2 (tools and sandbox) and M4 (web) done |
 
 The project is at an early stage. It is not ready for use on an arbitrary repository.
 
@@ -29,6 +29,10 @@ The project is at an early stage. It is not ready for use on an arbitrary reposi
   dependency graph and fails before any test runs. See [Toolchain](#toolchain).
 - An OpenCode Go subscription and its API key.
 - Network access to `opencode.ai`.
+- Rootless podman 4.9 or newer for the sandbox, and network access on the first run to pull the
+  base image and its packages.
+- The `smith-worker` binary next to `smith`, or `SMITH_WORKER_BIN` naming it. `cargo build`
+  produces both. The container runs tools, so smith refuses to start without a worker.
 
 > OpenCode Go and OpenCode Console are separate products with separate billing. smith targets
 > OpenCode Go (`https://opencode.ai/inference/go/openai/v1`), the subscription. The
@@ -85,9 +89,11 @@ smith
 The REPL reads a line, sends it, prints the reply and repeats. The transcript accumulates across
 turns, so follow-up questions have context. `/exit`, `/quit` or Ctrl-D exits the REPL.
 
-While a reply streams, Ctrl-C cancels the turn and returns to the prompt. It does not end the
-session. The session drops the cancelled turn from the transcript, so the model does not see a
-partial answer.
+While a reply streams, Esc pauses after the current step. The in-flight provider response and
+the current tool batch finish, the completed steps are recorded, and the prompt returns. The next
+message steers the model from that point. Esc again terminates the turn immediately. Ctrl-C also
+terminates. Termination drops the turn from the transcript, so the model does not see a partial
+answer; a paused turn keeps the steps that completed. The startup line names both shortcuts.
 
 Two kinds of output go to stderr, so stdout contains only the reply:
 - `--show-reasoning` prints reasoning tokens, dimmed, for models that emit them.
@@ -108,8 +114,10 @@ smith: open this URL: http://127.0.0.1:7878/#token=9f3c1b…
 smith: the token is this process's only credential and is never written to disk
 ```
 
-The browser lists and creates sessions, streams replies token by token and cancels a running
-turn. smith stores sessions in memory. Restarting smith loses them.
+The browser lists and creates sessions and streams replies token by token. While a turn runs,
+the `Pause` button and Esc pause after the current step; the button becomes `Terminate` and a
+second Esc terminates immediately. A paused turn keeps its completed steps and accepts a steering
+message. smith stores sessions in memory. Restarting smith loses them.
 
 The server is reachable from localhost only, and the bind address is not the only control.
 `--bind` accepts loopback and refuses any other address at startup, as a hard error rather than a
@@ -153,11 +161,11 @@ smith serve --repl
 
 `--repl` attaches a terminal to the same session manager the server uses. The session in the
 terminal also appears in the browser's session list, so one run can be watched in both places and
-cancelled from either. The browser renders every turn in the session. The terminal renders only
-the turns it started.
+paused or terminated from either. The browser renders every turn in the session. The terminal
+renders only the turns it started.
 
 Reaching end-of-input (Ctrl-D) detaches the terminal and leaves the server listening. `--repl`
-adds a frontend. It does not own the process. Ctrl-C cancels the running turn and stops the
+adds a frontend. It does not own the process. Ctrl-C terminates the running turn and stops the
 process when nothing is running.
 
 ### Choosing a model
@@ -185,12 +193,52 @@ its key, and its advertised models (`*` marks the default).
 smith --system "Answer only in JSON." -p "List three colours."
 ```
 
+## Sandbox
+
+Every tool call runs inside a podman container. There is no unsandboxed mode: when the
+container cannot start, the turn fails and smith prints why.
+
+- The container has no network interface. Egress is a `CONNECT` request that the worker sends
+  over the channel; the host checks it against the allowlist, resolves the name and dials. TLS
+  is end to end, and there is no DNS inside the sandbox.
+- The root filesystem is read-only, `/tmp` is a tmpfs, the workspace is mounted at its own
+  path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`.
+- The environment is computed rather than inherited. Values travel over the channel and never
+  appear in the container's command line.
+- The image is built on first use from a Containerfile embedded in the `smith` binary, with a
+  digest-pinned base. The build pulls roughly 150 MB, once per private store.
+- A session's container stops after `[sandbox] idle_timeout` without activity, on disconnect
+  and on process exit. Process state does not survive a stop; the filesystem does, through the
+  workspace and the caches.
+
+The allowlist is empty by default. A `cargo fetch` through the proxy needs these entries:
+
+```toml
+[sandbox.network]
+allow = ["index.crates.io:443", "static.crates.io:443", "github.com:443"]
+```
+
+An entry without a port matches every port on that host. A `host:port` entry matches that port
+only. IP addresses, loopback targets and SOCKS are refused. See [Sandbox settings](#sandbox-settings).
+
+Inspect and clean up containers:
+
+```sh
+smith sandbox ps            # containers in smith's private store
+smith sandbox stop <id>     # stop one
+smith sandbox rm <id>       # remove one, including after a crash
+```
+
+A `SIGKILL` of smith leaves the container behind. `smith sandbox ps` lists it, and
+`smith sandbox rm` removes it. Nothing is reaped silently.
+
 ---
 
 ## Configuration
 
-The precedence order, highest first, is CLI flags, then `SMITH_*` environment variables, then the
-config file, then built-in defaults. Each layer overrides only the fields it states.
+The precedence order, highest first, is CLI flags, then `SMITH_*` environment variables, then
+three config files, then built-in defaults. Within the files the system file outranks the user
+file, which outranks the project file. Each layer changes only the fields it states.
 
 ### Environment variables
 
@@ -206,8 +254,17 @@ config file, then built-in defaults. Each layer overrides only the fields it sta
 smith --config ./smith.toml -p "hi"
 ```
 
-There is no automatic discovery. `./smith.toml` and `~/.config/smith/config.toml` are not loaded
-unless `--config` names them.
+smith loads three files, in increasing priority:
+
+| tier | path |
+|---|---|
+| project | `$XDG_CONFIG_HOME/smith/projects/<hash>.toml` (default `~/.config`) |
+| user | `$XDG_CONFIG_HOME/smith/config.toml` |
+| system | `/etc/smith/config.toml` |
+
+The project file is keyed by the first 16 hex digits of the sha256 of the canonical workspace
+root. It records `[project] path`, and smith ignores it with a warning when it names another
+directory. `--config PATH` loads exactly that file and skips the three tiers.
 
 A config file is an overlay: it changes the fields it names and leaves every other field at its
 default. The following file is a complete configuration:
@@ -232,7 +289,7 @@ smith rejects unknown fields, so a typo is an error rather than a setting that d
 
 ```
 unknown field `temperatur`, expected one of `default_provider`, `model`, `system_prompt`,
-`max_tokens`, `temperature`, `serve`, `providers`
+`max_tokens`, `temperature`, `serve`, `project`, `sandbox`, `policy`, `providers`
 ```
 
 Every top-level key is optional:
@@ -244,6 +301,45 @@ Every top-level key is optional:
 | `system_prompt` | System message for every session |
 | `max_tokens`, `temperature` | Passed through to the provider |
 | `serve.bind`, `serve.port` | What `smith serve` binds when `--bind` or `--port` are not given. `bind` must be loopback |
+| `sandbox` | Sandbox settings, described below |
+| `policy.managed` | When true, a project file that sets a sandbox list is an error |
+| `project.path` | The canonical workspace root a project file belongs to |
+
+### Sandbox settings
+
+```toml
+[sandbox]
+idle_timeout = "5m"
+
+[sandbox.network]
+allow = ["index.crates.io:443", "static.crates.io:443"]
+
+[sandbox.mounts]
+ro = ["/home/chris/.rustup", "/home/chris/.cargo/bin"]
+
+[sandbox.env]
+inherit = ["RUST_BACKTRACE"]
+set = { CARGO_TERM_COLOR = "never" }
+
+[policy]
+managed = true
+```
+
+| key | meaning |
+|---|---|
+| `sandbox.idle_timeout` | How long an idle session keeps its container. Default `5m`, minimum 10 seconds |
+| `sandbox.network.allow` | Egress allowlist. Default empty |
+| `sandbox.mounts.ro` | Host paths mounted read-only at the same path. Defaults to `~/.rustup` and `~/.cargo/bin` when they exist |
+| `sandbox.mounts.rw` | Extra writable mounts. Default empty |
+| `sandbox.env.inherit` | Host variable names copied into the sandbox |
+| `sandbox.env.set` | Literal variables |
+| `policy.managed` | Reject project files that set a sandbox list |
+
+`allow` and `inherit` intersect across the tiers that set them, so a project file can narrow a
+list and never widen it. `mounts` and `policy` belong to the system or user file; a project file
+that sets either is an error. The credential deny list (`SSH_AUTH_SOCK`, `PODMAN_*`, `AWS_*`,
+`*_TOKEN`, `EDITOR` and others) is enforced at load time, and a refused name is an error naming
+the reason.
 
 The fields inside `[providers.<id>]` are:
 
@@ -272,13 +368,17 @@ The messages below are the text smith prints.
 | `no API key: environment variable OPENCODE_API_KEY is unset` | Export the key. smith checks for the key before any request, so the failure is immediate rather than a 401 during a session. |
 | `authentication rejected by opencode-go: FreeTierError: ...` | The request is reaching the Console endpoint with a free-tier model, or the key has no OpenCode Go entitlement. Check `base_url` and the subscription. |
 | `... upstream failure: ... Insufficient account funds` | The key is valid, but the account lacks credit for that model. |
+| `cannot find the worker binary at ...; run cargo build -p smith-worker or set SMITH_WORKER_BIN` | The sandbox needs `smith-worker` next to `smith`. `cargo build` builds both. |
+| `unknown field `provider`` | A config file from an older schema. The key is `[providers.<id>]`; smith rejects the file rather than migrating it. |
+| `the sandbox worker did not answer within 10s` | podman started but the channel did not complete. Check that the image starts (`podman --root ~/.local/share/smith/containers/storage run --rm smith-sandbox:<version> true`) and that the worker matches the smith version. |
 | `... Model is unavailable.` | The model id is wrong or not included in the plan. Run `smith providers list`, or check the model table in the OpenCode Go documentation. |
 | `configuration error: unknown provider 'x'; configured providers: opencode-go` | The error indicates a typo in `-m` or `SMITH_MODEL`. It lists the configured providers. |
 | `configuration error: refusing to bind 0.0.0.0: smith serve is reachable from localhost only...` | `--bind` was not a loopback address. Use `127.0.0.1` or `::1`. This is a hard error because a routable bind would expose the service. |
 | `unknown field 'temperatur', expected one of ...` | The config file contains a typo. Unknown keys are errors. |
 | `provider 'x' is new, so it has to set base_url` | A `[providers.x]` entry for a provider smith does not know must be complete because there is nothing to inherit from. |
 | `... sent a malformed response: ...` | The stream contained data that could not be parsed. This is usually a proxy or a changed upstream format. The message includes the offending payload. |
-| `smith: cancelled` | The user pressed Ctrl-C. This is not an error. |
+| `smith: cancelled` | Ctrl-C, Esc Esc, or a web terminate stopped the turn. Not an error. |
+| `smith: paused after the current step` | Esc paused the turn. Send a message to continue. |
 | `401` from the web server | The bearer token is missing or wrong. Open the URL smith printed at startup. The token arrives only in that fragment. |
 | `403` from the web server | A mutating request carried a different origin in its `Origin` header. |
 | `421` from the web server | The `Host` header is not one smith listens on. This is either an unknown name or DNS rebinding. |
@@ -293,8 +393,11 @@ wrong.
 
 ```
 crates/
-  smith-core/       domain, agent loop, session actor, provider trait, config
+  smith-channel/    frame codec and tool types shared by host and worker
+  smith-core/       domain, agent loop, session actor, provider trait, config, tool seam
   smith-providers/  provider adapters + registry                 (the only crate doing HTTP)
+  smith-sandbox/    podman supervision, image, allowlist, proxy dialer (host side)
+  smith-worker/     pid 1 inside the container: handshake, tools, proxy listener
   smith-cli/        the `smith` binary                           (headless, REPL, serve)
   smith-web/        the localhost web server                     (a frontend, no agent logic)
   smith-web/ui/     index.html, app.js, style.css                (no build step, no npm)
@@ -306,7 +409,8 @@ only renders its events. To check this, run:
 
 ```sh
 cargo tree -p smith-core -e normal | grep -E 'reqwest|hyper|axum|clap|rustyline'
-# must print nothing
+cargo tree -p smith-worker -e normal | grep -E 'reqwest|hyper|axum|clap|rustyline'
+# both must print nothing
 ```
 
 The same core serves every frontend. The REPL, the headless one-shot mode and the web server are
@@ -317,7 +421,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 77 offline tests; no network, no API key needed
+cargo test                        # 165 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -325,8 +429,19 @@ cargo clippy --all-targets -- -D warnings
 Tests replay recorded SSE streams from the live endpoint
 (`crates/smith-providers/tests/fixtures/`) rather than hand-written JSON. The fixtures cover the
 empty-`choices` usage chunk and the separate `reasoning_content` channel. A scripted
-`MockProvider` (`smith-core/src/mock.rs`) exercises the session layer, CLI rendering and web API.
-Exactly one test opens a real socket, which proves the bound address is loopback.
+`MockProvider` and `MockTool` (`smith-core/src/mock.rs`) exercise the session layer, the tool
+loop, CLI rendering and the web API. Exactly one test opens a real socket, which proves the
+bound address is loopback.
+
+Two tests are ignored because they build the image and start containers:
+
+```sh
+cargo build -p smith-worker
+cargo test -p smith-sandbox -- --ignored
+```
+
+The first runs `run_shell` and `write_file` against a container. The second runs `cargo fetch`
+through the proxy and checks that a host outside the allowlist is refused.
 
 ### Toolchain
 

@@ -138,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}", get(api::get_session))
         .route("/sessions/{id}/messages", post(api::send_message))
+        .route("/sessions/{id}/pause", post(api::pause_turn))
         .route("/sessions/{id}/cancel", post(api::cancel_turn))
         .route("/sessions/{id}/events", get(sse::events))
         .layer(axum::middleware::from_fn_with_state(

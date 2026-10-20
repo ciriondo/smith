@@ -12,9 +12,12 @@ use axum::http::{Request, StatusCode};
 use futures_util::{Stream, StreamExt};
 use tower::ServiceExt;
 
-use smith_core::mock::MockProvider;
+use smith_core::mock::{MockProvider, MockTool};
+use smith_core::provider::ProviderEvent;
 use smith_core::session::{SessionConfig, SessionManager, Subscription, UiEventKind};
+use smith_core::{StopReason, Tool, ToolContext, ToolError, ToolSpec};
 use smith_web::{AppState, ServerConfig};
+use tokio::sync::Semaphore;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PORT: u16 = 7878;
@@ -29,7 +32,8 @@ fn sessions(provider: Arc<MockProvider>) -> Arc<SessionManager> {
         provider,
         model: "mock-1".to_string(),
         system: None,
-        tools: Vec::new(),
+        tools: Vec::new().into(),
+        workspace: std::env::temp_dir(),
         max_tokens: None,
         temperature: None,
     }))
@@ -37,6 +41,72 @@ fn sessions(provider: Arc<MockProvider>) -> Arc<SessionManager> {
 
 fn state(provider: Arc<MockProvider>) -> AppState {
     AppState::new(sessions(provider), TOKEN, PORT)
+}
+
+fn state_with_tools(provider: Arc<MockProvider>, tools: Vec<Arc<dyn Tool>>) -> AppState {
+    AppState::new(
+        Arc::new(SessionManager::new(SessionConfig {
+            provider,
+            model: "mock-1".to_string(),
+            system: None,
+            tools: tools.into(),
+            workspace: std::env::temp_dir(),
+            max_tokens: None,
+            temperature: None,
+        })),
+        TOKEN,
+        PORT,
+    )
+}
+
+/// A tool whose call blocks until the test releases it, so the pause lands mid-batch.
+struct BlockingTool {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl BlockingTool {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+impl Tool for BlockingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "blocking".to_string(),
+            description: "a tool that blocks until released".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, ToolError>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.add_permits(1);
+            let _permit = release.acquire().await.map_err(|_| {
+                ToolError::Message("the test tool lost its release channel".to_string())
+            })?;
+            Ok("{\"content\":\"blocked\"}".to_string())
+        })
+    }
+}
+
+fn tool_call_event(id: &str, name: &str) -> ProviderEvent {
+    ProviderEvent::ToolCallDelta {
+        index: 0,
+        id: Some(id.to_string()),
+        name: Some(name.to_string()),
+        args_delta: "{}".to_string(),
+    }
 }
 
 /// A request with a valid token and the `Host` the server expects.
@@ -444,6 +514,118 @@ fn tokens_are_random_and_long_enough() {
     assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
+#[tokio::test]
+async fn pausing_a_turn_emits_both_events_and_records_the_completed_steps() {
+    let provider = Arc::new(MockProvider::new("mock"));
+    provider.push_events(vec![
+        tool_call_event("call_1", "blocking"),
+        ProviderEvent::Done {
+            stop_reason: StopReason::ToolUse,
+        },
+    ]);
+    provider.push_text("unused");
+    let tool = Arc::new(BlockingTool::new());
+    let app = smith_web::router(state_with_tools(
+        provider,
+        vec![tool.clone() as Arc<dyn Tool>],
+    ));
+
+    let (_, body) = send(app.clone(), authorised("POST", "/api/sessions")).await;
+    let id = body
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a session id")
+        .to_string();
+
+    // Open the stream before the turn so the browser sees the pause events live.
+    let events = app
+        .clone()
+        .oneshot(authorised("GET", &format!("/api/sessions/{id}/events")))
+        .await
+        .expect("the router must answer");
+    assert_eq!(events.status(), StatusCode::OK);
+
+    let (status, _) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/api/sessions/{id}/messages"),
+            r#"{"text":"go"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    tool.started.acquire().await.unwrap().forget();
+    let (status, body) = send(
+        app.clone(),
+        authorised("POST", &format!("/api/sessions/{id}/pause")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.contains("pausing"), "{body}");
+    tool.release.add_permits(1);
+
+    let seen = read_until_quiet(events.into_body().into_data_stream(), QUIET).await;
+    assert!(seen.contains("event: pause_requested"), "{seen}");
+    assert!(seen.contains("event: turn_paused"), "{seen}");
+    assert!(
+        !seen.contains("event: turn_finished"),
+        "a paused turn is not a finished one: {seen}"
+    );
+
+    // The transcript holds the prompt, the tool call and the tool result.
+    let (_, transcript) = send(app, authorised("GET", &format!("/api/sessions/{id}"))).await;
+    assert!(transcript.contains("\"text\":\"go\""), "{transcript}");
+    assert!(
+        transcript.contains("\"type\":\"tool_result\""),
+        "{transcript}"
+    );
+}
+
+#[tokio::test]
+async fn pausing_an_idle_session_reports_idle_and_unknown_is_404() {
+    let app = smith_web::router(state(Arc::new(MockProvider::new("mock"))));
+    let (_, body) = send(app.clone(), authorised("POST", "/api/sessions")).await;
+    let id = body
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a session id")
+        .to_string();
+
+    let (status, body) = send(
+        app.clone(),
+        authorised("POST", &format!("/api/sessions/{id}/pause")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.contains("idle"), "{body}");
+    assert_eq!(
+        send(app, authorised("POST", "/api/sessions/nope/pause"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn the_ui_ships_the_pause_controls_and_shortcuts() {
+    let app = smith_web::router(state(Arc::new(MockProvider::new("mock"))));
+
+    let (status, index) = send(app.clone(), authorised("GET", "/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(index.contains("id=\"stop\""), "{index}");
+    assert!(index.contains("esc pause"), "{index}");
+
+    let (status, js) = send(app, authorised("GET", "/app.js")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(js.contains("stopAction"), "{js}");
+    assert!(js.contains("turn_paused"), "{js}");
+    assert!(js.contains("event.key !== \"Escape\""), "{js}");
+}
+
 /// The only test that uses a real socket. It proves the bound address is loopback and
 /// exercises the full create → send → stream path over TCP.
 #[tokio::test]
@@ -767,4 +949,64 @@ async fn a_stream_that_lags_is_told_to_resync() {
         seen.contains("event: turn_finished"),
         "the stream carries on after resyncing: {seen}"
     );
+}
+
+/// A tool call in a turn produces two SSE frames, in order, which is what the browser
+/// renders as a note.
+#[tokio::test]
+async fn tool_events_are_streamed() {
+    let provider = Arc::new(MockProvider::new("mock"));
+    provider.push_events(vec![
+        ProviderEvent::ToolCallDelta {
+            index: 0,
+            id: Some("c1".to_string()),
+            name: Some("read_file".to_string()),
+            args_delta: "{\"path\":\"a.txt\"}".to_string(),
+        },
+        ProviderEvent::Done {
+            stop_reason: StopReason::ToolUse,
+        },
+    ]);
+    provider.push_text("done");
+
+    let tool = Arc::new(MockTool::new(
+        "read_file",
+        "{\"content\":\"x\",\"truncated\":false}",
+    ));
+    let manager = Arc::new(SessionManager::new(SessionConfig {
+        provider: provider.clone(),
+        model: "mock-1".to_string(),
+        system: None,
+        tools: vec![tool as Arc<dyn Tool>].into(),
+        workspace: std::env::temp_dir(),
+        max_tokens: None,
+        temperature: None,
+    }));
+    let session = manager.create();
+    let id = session.id().to_string();
+    let app = smith_web::router(AppState::new(manager, TOKEN, PORT));
+
+    let response = app
+        .clone()
+        .oneshot(authorised("GET", &format!("/api/sessions/{id}/events")))
+        .await
+        .expect("the stream must open");
+    let stream = response.into_body().into_data_stream();
+
+    let (status, _) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/api/sessions/{id}/messages"),
+            "{\"text\":\"go\"}",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let frames = read_until_quiet(stream, QUIET).await;
+    let started = frames.find("event: tool_started").expect("tool_started");
+    let finished = frames.find("event: tool_finished").expect("tool_finished");
+    assert!(started < finished, "the events must stay in order");
+    assert!(frames.contains("read_file"), "{frames}");
 }

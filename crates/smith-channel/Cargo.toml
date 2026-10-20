@@ -1,0 +1,14 @@
+[package]
+name = "smith-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The host and the worker share this crate. It must stay free of async runtimes, networking
+# clients and HTTP crates, so the worker links into a small static binary.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

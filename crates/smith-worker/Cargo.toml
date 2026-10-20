@@ -1,0 +1,28 @@
+[package]
+name = "smith-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Runs as pid 1 inside the sandbox. It must not link a provider client, an HTTP server or a
+# terminal library: `cargo tree -p smith-worker` must not show reqwest/axum/clap/rustyline.
+[lib]
+name = "smith_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smith-worker"
+path = "src/main.rs"
+
+[dependencies]
+smith-channel.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+command-fds.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -54,6 +54,9 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 #main { display: flex; flex-direction: column; min-height: 0; }
 
+.actions { display: flex; align-items: center; gap: 0.8rem; }
+.hint { color: var(--dim); font-size: 0.8rem; }
+
 #header {
   display: flex;
   justify-content: space-between;

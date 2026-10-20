@@ -1,13 +1,25 @@
-//! Config is loaded in four layers: built-in defaults, `smith.toml`, `SMITH_*` environment
-//! variables and CLI flags, in increasing precedence.
+//! Config is assembled from tiers and overlays.
+//!
+//! Scalars come from the highest tier that sets them: the system file outranks the user file,
+//! which outranks the project file. Sandbox lists intersect across the tiers that set them,
+//! so no tier can widen another. `SMITH_MODEL` and `SMITH_PROVIDER` are applied last.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::SmithError;
+
+/// Where the system tier lives.
+pub const SYSTEM_CONFIG: &str = "/etc/smith/config.toml";
+/// The smallest accepted idle timeout.
+const MIN_IDLE: Duration = Duration::from_secs(10);
 
 /// Port `smith serve` binds when no port is configured. 7878 avoids 3000 and 8080, which
 /// commonly collide with other services.
@@ -61,6 +73,9 @@ pub struct Config {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub serve: ServeConfig,
+    /// Merged by [`load_tiers`]; not part of the file schema this type deserialises.
+    #[serde(skip)]
+    pub sandbox: SandboxSettings,
     pub providers: BTreeMap<String, ProviderConfig>,
 }
 
@@ -120,6 +135,7 @@ impl Default for Config {
             max_tokens: None,
             temperature: None,
             serve: ServeConfig::default(),
+            sandbox: SandboxSettings::default(),
             providers,
         }
     }
@@ -131,7 +147,7 @@ impl Default for Config {
 /// This type is deliberately not [`Config`]. Deserialising into `Config` makes a partial file
 /// replace the defaults and fail with `missing field 'default_provider'`. An overlay merged
 /// field by field implements the layered precedence.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     default_provider: Option<String>,
@@ -140,11 +156,55 @@ struct FileConfig {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     serve: Option<FileServe>,
+    project: Option<FileProject>,
+    sandbox: Option<FileSandbox>,
+    policy: Option<FilePolicy>,
     providers: Option<BTreeMap<String, FileProvider>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileProject {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSandbox {
+    idle_timeout: Option<String>,
+    network: Option<FileNetwork>,
+    mounts: Option<FileMounts>,
+    env: Option<FileEnv>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileNetwork {
+    allow: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileMounts {
+    ro: Option<Vec<PathBuf>>,
+    rw: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileEnv {
+    inherit: Option<Vec<String>>,
+    set: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePolicy {
+    managed: Option<bool>,
+}
+
 /// `[serve]` in a file: the same two settings, either of them optional.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileServe {
     bind: Option<IpAddr>,
@@ -153,7 +213,7 @@ struct FileServe {
 
 /// One provider entry in a file. An entry for a configured provider overrides only the fields
 /// it mentions. An entry for a new provider has nothing to inherit from and must be complete.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileProvider {
     kind: Option<ProviderKind>,
@@ -198,35 +258,57 @@ impl Config {
             .ok_or_else(|| SmithError::Config(format!("unknown provider '{id}'")))
     }
 
-    /// Load config, layering defaults, an optional `smith.toml`, then `SMITH_*` environment
-    /// variables.
-    ///
-    /// Each layer overrides only the fields it states. Unknown fields in `smith.toml` are
-    /// rejected, so a typo is an error rather than a setting that does nothing.
+    /// Load one file over the defaults, skipping the machine's tiers. `--config` and tests
+    /// use this.
     pub fn load(path: Option<&Path>) -> Result<Self, SmithError> {
-        let mut config = Config::default();
+        match path {
+            Some(path) => load_tiers(&[(Tier::User, path.to_path_buf())]),
+            None => load_tiers(&[]),
+        }
+    }
 
-        if let Some(path) = path {
+    /// Load the system, user and project tiers for a workspace, highest priority last.
+    pub fn load_for_workspace(workspace: &Path) -> Result<Self, SmithError> {
+        let canonical = workspace.canonicalize().map_err(|e| {
+            SmithError::Config(format!(
+                "cannot resolve the workspace {}: {e}",
+                workspace.display()
+            ))
+        })?;
+
+        let mut tiers = Vec::new();
+        let project_path = project_config_path(&canonical)?;
+        if project_path.exists() {
+            let text = std::fs::read_to_string(&project_path)?;
+            let file: FileConfig = toml::from_str(&text)
+                .map_err(|e| SmithError::Config(format!("{}: {e}", project_path.display())))?;
+            match &file.project {
+                Some(project) if project.path == canonical => {
+                    tiers.push((Tier::Project, project_path));
+                }
+                Some(project) => eprintln!(
+                    "smith: ignoring {}: it is for {}, and the workspace is {}",
+                    project_path.display(),
+                    project.path.display(),
+                    canonical.display()
+                ),
+                None => eprintln!(
+                    "smith: ignoring {}: it has no [project] path",
+                    project_path.display()
+                ),
+            }
+        }
+
+        for (tier, path) in [
+            (Tier::User, user_config_path()),
+            (Tier::System, PathBuf::from(SYSTEM_CONFIG)),
+        ] {
             if path.exists() {
-                let text = std::fs::read_to_string(path)?;
-                let file: FileConfig = toml::from_str(&text)
-                    .map_err(|e| SmithError::Config(format!("{}: {e}", path.display())))?;
-                config.overlay(file, path)?;
+                tiers.push((tier, path));
             }
         }
 
-        if let Ok(model) = std::env::var("SMITH_MODEL") {
-            if !model.is_empty() {
-                config.model = model;
-            }
-        }
-        if let Ok(provider) = std::env::var("SMITH_PROVIDER") {
-            if !provider.is_empty() {
-                config.default_provider = provider;
-            }
-        }
-
-        Ok(config)
+        load_tiers(&tiers)
     }
 
     /// Apply a config file's overlay over the defaults, changing the fields it names.
@@ -333,6 +415,366 @@ impl FileProvider {
     }
 }
 
+/// Which file a setting came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    System,
+    User,
+    Project,
+}
+
+/// One allowlist entry: a host name, optionally restricted to one port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEntry {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+impl NetworkEntry {
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        self.host.eq_ignore_ascii_case(host) && self.port.is_none_or(|wanted| wanted == port)
+    }
+}
+
+impl FromStr for NetworkEntry {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let text = raw.trim();
+        if text.is_empty() {
+            return Err("an empty allowlist entry is not valid".to_string());
+        }
+        if text.matches(':').count() > 1 {
+            return Err(format!("'{text}': IPv6 entries are not supported"));
+        }
+        let (host, port) = match text.rsplit_once(':') {
+            Some((host, port)) => {
+                let port: u16 = port
+                    .parse()
+                    .map_err(|_| format!("'{text}': '{port}' is not a port"))?;
+                if port == 0 {
+                    return Err(format!("'{text}': port 0 is not valid"));
+                }
+                (host, Some(port))
+            }
+            None => (text, None),
+        };
+        if host.is_empty() {
+            return Err(format!("'{text}': the host is empty"));
+        }
+        if host.parse::<IpAddr>().is_ok() {
+            return Err(format!(
+                "'{text}': IP entries are not supported; use a host name"
+            ));
+        }
+        if host.chars().any(char::is_whitespace) {
+            return Err(format!("'{text}': the host contains whitespace"));
+        }
+        Ok(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+}
+
+impl std::fmt::Display for NetworkEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            Some(port) => write!(f, "{}:{port}", self.host),
+            None => f.write_str(&self.host),
+        }
+    }
+}
+
+/// The sandbox settings after merging every tier.
+#[derive(Debug, Clone)]
+pub struct SandboxSettings {
+    pub idle_timeout: Duration,
+    pub allow: Vec<NetworkEntry>,
+    pub ro_mounts: Vec<PathBuf>,
+    pub rw_mounts: Vec<PathBuf>,
+    pub env_inherit: Vec<String>,
+    pub env_set: BTreeMap<String, String>,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(5 * 60),
+            allow: Vec::new(),
+            ro_mounts: default_ro_mounts(),
+            rw_mounts: Vec::new(),
+            env_inherit: Vec::new(),
+            env_set: BTreeMap::new(),
+        }
+    }
+}
+
+/// The host toolchain directories, mounted read-only when they exist. A file that sets `ro`
+/// replaces this list.
+fn default_ro_mounts() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    [home.join(".rustup"), home.join(".cargo/bin")]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+/// The variable deny list. Each name is refused with the reason it is refused.
+pub fn denied_env_name(name: &str) -> Option<&'static str> {
+    let reason = match name {
+        "CONTAINER_HOST" | "DOCKER_HOST" => "a runtime socket is a full escape",
+        "SSH_AUTH_SOCK" | "SSH_AGENT_PID" => "it signs commits and mail as the user",
+        "GPG_AGENT_INFO" | "KRB5CCNAME" => "it carries a credential into the sandbox",
+        "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR" => "it reaches the desktop session bus",
+        "DISPLAY" | "WAYLAND_DISPLAY" => "it reaches the display server",
+        "GIT_SSH_COMMAND" | "GIT_ASKPASS" | "BASH_ENV" | "PROMPT_COMMAND" | "EDITOR" | "PAGER" => {
+            "it injects execution into later tool calls"
+        }
+        "HOME" => "it is computed for the sandbox, not inherited",
+        _ if name.starts_with("PODMAN_") => "a runtime socket is a full escape",
+        _ if name.starts_with("AWS_") => "it forwards cloud credentials",
+        _ if name.ends_with("_TOKEN") => "it forwards a credential",
+        _ => return None,
+    };
+    Some(reason)
+}
+
+/// Load explicit tiers, lowest priority first. Each tier names the file it came from.
+pub fn load_tiers(tiers: &[(Tier, PathBuf)]) -> Result<Config, SmithError> {
+    let mut loaded = Vec::new();
+    for (tier, path) in tiers {
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(path)?;
+        let file: FileConfig = toml::from_str(&text)
+            .map_err(|e| SmithError::Config(format!("{}: {e}", path.display())))?;
+        loaded.push((*tier, path.clone(), file));
+    }
+
+    let sandbox = merge_sandbox(&loaded)?;
+    let mut config = Config::default();
+    for (_, path, file) in &loaded {
+        config.overlay(file.clone(), path)?;
+    }
+    config.sandbox = sandbox;
+
+    if let Ok(model) = std::env::var("SMITH_MODEL") {
+        if !model.is_empty() {
+            config.model = model;
+        }
+    }
+    if let Ok(provider) = std::env::var("SMITH_PROVIDER") {
+        if !provider.is_empty() {
+            config.default_provider = provider;
+        }
+    }
+
+    Ok(config)
+}
+
+fn merge_sandbox(loaded: &[(Tier, PathBuf, FileConfig)]) -> Result<SandboxSettings, SmithError> {
+    // `[policy]` may come from the system or user file, and it changes how a project file is
+    // read, so it is decided before the project tier is examined.
+    let mut managed = false;
+    for (tier, path, file) in loaded {
+        if let Some(policy) = &file.policy {
+            if *tier == Tier::Project {
+                return Err(config_error(
+                    path,
+                    "[policy] belongs in the system or user config",
+                ));
+            }
+            if policy.managed == Some(true) {
+                managed = true;
+            }
+        }
+    }
+
+    let defaults = SandboxSettings::default();
+    let mut idle_timeout = defaults.idle_timeout;
+    let mut allow_lists: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut inherit_lists: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut env_set = BTreeMap::new();
+    let mut ro = Vec::new();
+    let mut rw = Vec::new();
+    let mut ro_set = false;
+    let mut rw_set = false;
+
+    for (tier, path, file) in loaded {
+        let Some(sandbox) = &file.sandbox else {
+            continue;
+        };
+        if *tier == Tier::Project {
+            if sandbox.mounts.is_some() {
+                return Err(config_error(
+                    path,
+                    "[sandbox.mounts] belongs in the system or user config",
+                ));
+            }
+            let attempts_list = sandbox
+                .network
+                .as_ref()
+                .is_some_and(|network| network.allow.is_some())
+                || sandbox
+                    .env
+                    .as_ref()
+                    .is_some_and(|env| env.inherit.is_some());
+            if managed && attempts_list {
+                return Err(config_error(
+                    path,
+                    "[policy] managed forbids sandbox lists in a project config",
+                ));
+            }
+        }
+
+        if let Some(text) = &sandbox.idle_timeout {
+            idle_timeout = parse_idle_timeout(text).map_err(|e| config_error(path, &e))?;
+        }
+        if let Some(network) = &sandbox.network {
+            if let Some(allow) = &network.allow {
+                allow_lists.push((path.clone(), allow.clone()));
+            }
+        }
+        if let Some(mounts) = &sandbox.mounts {
+            if let Some(list) = &mounts.ro {
+                ro_set = true;
+                ro.extend(list.iter().cloned());
+            }
+            if let Some(list) = &mounts.rw {
+                rw_set = true;
+                rw.extend(list.iter().cloned());
+            }
+        }
+        if let Some(env) = &sandbox.env {
+            if let Some(inherit) = &env.inherit {
+                inherit_lists.push((path.clone(), inherit.clone()));
+            }
+            if let Some(map) = &env.set {
+                for (name, value) in map {
+                    env_set.insert(name.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    let mut allow = Vec::new();
+    for (path, list) in &allow_lists {
+        let parsed: Vec<NetworkEntry> = list
+            .iter()
+            .map(|entry| NetworkEntry::from_str(entry).map_err(|e| config_error(path, &e)))
+            .collect::<Result<_, _>>()?;
+        if allow.is_empty() && allow_lists.len() > 1 {
+            // The first list seeds the intersection; an empty first list means "deny all".
+        }
+        if allow.is_empty() {
+            allow = parsed;
+        } else {
+            allow.retain(|entry| parsed.contains(entry));
+        }
+    }
+    if allow_lists.len() > 1 && allow_lists.iter().any(|(_, list)| list.is_empty()) {
+        allow.clear();
+    }
+
+    let inherit = intersect_names(&inherit_lists);
+    for name in inherit.iter().chain(env_set.keys()) {
+        if let Some(reason) = denied_env_name(name) {
+            return Err(SmithError::Config(format!(
+                "refusing environment variable {name}: {reason}"
+            )));
+        }
+    }
+    for name in &inherit {
+        if std::env::var_os(name).is_none() {
+            return Err(SmithError::Config(format!(
+                "inherited environment variable {name} is not set"
+            )));
+        }
+    }
+
+    Ok(SandboxSettings {
+        idle_timeout,
+        allow,
+        ro_mounts: if ro_set { ro } else { default_ro_mounts() },
+        rw_mounts: if rw_set { rw } else { Vec::new() },
+        env_inherit: inherit,
+        env_set,
+    })
+}
+
+fn intersect_names(lists: &[(PathBuf, Vec<String>)]) -> Vec<String> {
+    let mut result: Option<Vec<String>> = None;
+    for (_, list) in lists {
+        result = Some(match result {
+            None => list.clone(),
+            Some(current) => current
+                .into_iter()
+                .filter(|name| list.contains(name))
+                .collect(),
+        });
+    }
+    result.unwrap_or_default()
+}
+
+fn config_error(path: &Path, message: &str) -> SmithError {
+    SmithError::Config(format!("{}: {message}", path.display()))
+}
+
+fn parse_idle_timeout(text: &str) -> Result<Duration, String> {
+    let trimmed = text.trim();
+    if trimmed.len() < 2 {
+        return Err(format!("'{trimmed}' is not a duration; use 30s, 5m or 1h"));
+    }
+    let (number, unit) = trimmed.split_at(trimmed.len() - 1);
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("'{trimmed}' is not a duration; use 30s, 5m or 1h"))?;
+    let seconds = match unit {
+        "s" => value,
+        "m" => value.saturating_mul(60),
+        "h" => value.saturating_mul(3600),
+        _ => return Err(format!("'{trimmed}': use s, m or h as the unit")),
+    };
+    let duration = Duration::from_secs(seconds);
+    if duration < MIN_IDLE {
+        return Err(format!("'{trimmed}' is below the 10-second minimum"));
+    }
+    Ok(duration)
+}
+
+/// `$XDG_CONFIG_HOME`, or `~/.config`.
+pub fn config_home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+}
+
+/// The user tier: `$XDG_CONFIG_HOME/smith/config.toml`.
+pub fn user_config_path() -> PathBuf {
+    config_home().join("smith/config.toml")
+}
+
+/// The project tier for a workspace, keyed by the first 16 hex digits of the sha256 of the
+/// canonical root.
+pub fn project_config_path(workspace: &Path) -> Result<PathBuf, SmithError> {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace.as_os_str().as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(config_home()
+        .join("smith/projects")
+        .join(format!("{hash}.toml")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +867,178 @@ mod tests {
 
     fn with_config<T>(name: &str, body: &str, use_it: impl FnOnce(&Config) -> T) -> T {
         use_it(&load_str(name, body).expect("the config must load"))
+    }
+
+    fn write_tier(name: &str, body: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("smith-tier-{name}-{}.toml", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn load_named(name: &str, tiers: &[(Tier, &str)]) -> Result<Config, String> {
+        let _guard = lock_env();
+        let mut paths = Vec::new();
+        for (index, (tier, body)) in tiers.iter().enumerate() {
+            paths.push((*tier, write_tier(&format!("{name}-{index}"), body)));
+        }
+        let result = load_tiers(&paths).map_err(|e| e.to_string());
+        for (_, path) in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    #[test]
+    fn scalars_take_the_highest_tier() {
+        let cfg = load_named(
+            "scalars",
+            &[
+                (Tier::Project, "model = \"project-model\"\n"),
+                (Tier::User, "model = \"user-model\"\n"),
+                (Tier::System, "model = \"system-model\"\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "system-model");
+
+        let cfg = load_named(
+            "scalars-two",
+            &[
+                (Tier::Project, "model = \"project-model\"\n"),
+                (Tier::User, "model = \"user-model\"\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "user-model");
+    }
+
+    #[test]
+    fn allow_lists_intersect_across_tiers() {
+        let cfg = load_named(
+            "allow",
+            &[
+                (
+                    Tier::Project,
+                    "[sandbox.network]\nallow = [\"b:443\", \"c:443\"]\n",
+                ),
+                (
+                    Tier::System,
+                    "[sandbox.network]\nallow = [\"a:443\", \"b:443\"]\n",
+                ),
+            ],
+        )
+        .unwrap();
+        let names: Vec<String> = cfg.sandbox.allow.iter().map(|e| e.to_string()).collect();
+        assert_eq!(names, vec!["b:443".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_list_in_one_tier_denies_everything() {
+        let cfg = load_named(
+            "allow-empty",
+            &[
+                (Tier::Project, "[sandbox.network]\nallow = [\"a:443\"]\n"),
+                (Tier::System, "[sandbox.network]\nallow = []\n"),
+            ],
+        )
+        .unwrap();
+        assert!(cfg.sandbox.allow.is_empty());
+    }
+
+    #[test]
+    fn managed_rejects_a_project_list() {
+        let error = load_named(
+            "managed",
+            &[
+                (Tier::Project, "[sandbox.network]\nallow = [\"a:443\"]\n"),
+                (Tier::System, "[policy]\nmanaged = true\n"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("managed"), "{error}");
+    }
+
+    #[test]
+    fn a_project_mount_table_is_an_error() {
+        let error = load_named(
+            "project-mount",
+            &[(Tier::Project, "[sandbox.mounts]\nro = [\"/tmp\"]\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("[sandbox.mounts]"), "{error}");
+    }
+
+    #[test]
+    fn an_ip_allowlist_entry_is_rejected() {
+        let error = load_named(
+            "ip",
+            &[(Tier::User, "[sandbox.network]\nallow = [\"1.2.3.4\"]\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("IP entries"), "{error}");
+    }
+
+    #[test]
+    fn a_denied_environment_name_is_an_error() {
+        let error = load_named(
+            "denied-env",
+            &[(Tier::User, "[sandbox.env]\nset = { EDITOR = \"vi\" }\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("EDITOR"), "{error}");
+        assert!(error.contains("injects execution"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_inherited_name_is_an_error() {
+        let error = load_named(
+            "missing-env",
+            &[(
+                Tier::User,
+                "[sandbox.env]\ninherit = [\"SMITH_TEST_MISSING_VARIABLE\"]\n",
+            )],
+        )
+        .unwrap_err();
+        assert!(error.contains("SMITH_TEST_MISSING_VARIABLE"), "{error}");
+    }
+
+    #[test]
+    fn idle_timeout_parses_and_enforces_the_minimum() {
+        let cfg = load_named(
+            "idle",
+            &[(Tier::User, "[sandbox]\nidle_timeout = \"5m\"\n")],
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox.idle_timeout, Duration::from_secs(300));
+
+        let error = load_named(
+            "idle-short",
+            &[(Tier::User, "[sandbox]\nidle_timeout = \"5s\"\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("10-second minimum"), "{error}");
+    }
+
+    #[test]
+    fn allowlist_entries_match_host_and_port() {
+        let open: NetworkEntry = "GitHub.com".parse().unwrap();
+        assert!(open.matches("github.com", 443));
+        assert!(open.matches("github.com", 22));
+
+        let pinned: NetworkEntry = "index.crates.io:443".parse().unwrap();
+        assert!(pinned.matches("index.crates.io", 443));
+        assert!(!pinned.matches("index.crates.io", 80));
+        assert!(!pinned.matches("static.crates.io", 443));
+    }
+
+    #[test]
+    fn denied_names_are_named_with_a_reason() {
+        assert!(denied_env_name("PODMAN_SOCKET").is_some());
+        assert!(denied_env_name("AWS_SECRET_ACCESS_KEY").is_some());
+        assert!(denied_env_name("SOME_TOKEN").is_some());
+        assert!(denied_env_name("HOME").is_some());
+        assert!(denied_env_name("RUST_BACKTRACE").is_none());
     }
 
     /// A partial config file overrides the fields it names and keeps every default it does

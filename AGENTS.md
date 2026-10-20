@@ -7,7 +7,7 @@ code or module docs.
 ## Build, test, lint
 
 ```sh
-cargo build                                  # debug build of every workspace member
+cargo build                                  # both binaries and every workspace member
 cargo test                                   # unit tests and the integration suites
 cargo test <name>                            # only tests whose name matches <name>
 cargo test -p smith-core                     # restrict to one crate
@@ -17,8 +17,10 @@ cargo clippy --all-targets -- -D warnings
 
 All build, test and lint commands go through cargo. There is no wrapper script or second build
 system. `smith` is the only binary. `cargo run -q -p smith-cli -- …` runs it during development.
-The test suite is offline. It requires no API key and no external network access. The only
-socket any test opens is bound to loopback.
+The default test suite is offline. It requires no API key and no external network access. The
+only socket it opens is bound to loopback. One test is ignored: it builds the sandbox image and
+starts a container, so it needs podman and network. Run it with
+`cargo test -p smith-sandbox -- --ignored` after `cargo build -p smith-worker`.
 
 Use rustup's cargo. The system `cargo` (version 1.75 on this machine) cannot parse the dependency
 graph and fails with `lock file version 4 requires -Znext-lockfile-bump`. That failure is a
@@ -72,24 +74,29 @@ named, or the PID you captured at launch.
 
 ## Architecture
 
-smith is a cargo workspace with one binary, `smith`. The terminal REPL, the headless one-shot
-mode and the web server share its session actors.
+smith is a cargo workspace with two binaries: `smith`, the agent, and `smith-worker`, the
+sandbox worker. The terminal REPL, the headless one-shot mode and the web server share `smith`'s
+session actors.
 
 The data flow is:
 
 `Command → session actor → agent turn → provider stream → UiEvent → frontend`
 
-The stable extension seams are `smith_core::Provider` (a wire-format adapter) and the
-`Command`/`UiEventKind` pair (a frontend). Tool execution will be added behind the session layer.
-Frontends do not execute tools.
+A tool call adds a branch: `agent turn → smith_core::Tool → smith-sandbox → channel →
+smith-worker → container process`.
+
+The stable extension seams are `smith_core::Provider` (a wire-format adapter), the
+`Command`/`UiEventKind` pair (a frontend) and `smith_core::Tool` (a tool implementation).
+Frontends do not execute tools, and only the worker touches the container.
 
 Terminology:
 
-- A **turn** is one provider stream round-trip that produces one assistant message and, once
-  tools exist, optional tool calls. A turn that starts ends with exactly one of `TurnFinished`,
+- A **turn** is one provider stream round-trip that produces one assistant message and optional
+  tool calls. A turn that starts ends with exactly one of `TurnFinished`, `TurnPaused`,
   `TurnFailed` or `Cancelled`.
-- A **user turn** will be one prompt plus every turn spawned until the model stops requesting
-  tools. Until tools are implemented, one prompt is exactly one turn.
+- A **user turn** is one prompt plus every turn spawned until the model stops requesting tools.
+  A pause stops the user turn at the next provider-request boundary. The loop lives in
+  `run_agent` (`smith-core/src/agent.rs`).
 - `UiEvent.seq` is session-scoped, monotonic and never reused. Resume and `Last-Event-ID` depend
   on it.
 
@@ -100,8 +107,9 @@ Core boundaries:
 - The session actor owns the canonical conversation state as a provider-independent
   `Vec<Message>`, exposed as `SessionSnapshot.transcript`. Tool calls and results are
   `ContentBlock`s, not roles. Deltas are never persisted. The transcript gains the user and
-  assistant messages exactly once, when a turn finishes. A failed or cancelled turn leaves the
-  transcript unchanged. Frontends keep no copy of their own.
+  assistant messages exactly once, when a turn finishes or pauses. A paused turn keeps the steps
+  that completed before the boundary; a failed or cancelled turn leaves the transcript unchanged.
+  Frontends keep no copy of their own.
 - Provider adapters implement native API protocols and wire formats. Shared transport implements
   HTTP and SSE mechanics. Adapters serialize `ChatRequest` and emit provider-independent
   `ProviderEvent`s. Agent and frontend behavior must not depend on native response shapes.
@@ -110,6 +118,10 @@ Core boundaries:
 - Behavior shared by the interactive, one-shot and web frontends belongs in the session actor
   (`smith-core/src/session.rs`). Frontends send `Command`s and render `UiEvent`s. They do not
   duplicate the turn loop. Cancellation is `Command::Cancel`, not a frontend-local mechanism.
+- A pause is `Command::Pause`. The loop checks it at the top of each provider iteration, so the
+  in-flight provider response and the whole tool batch finish first. The terminal watcher
+  (`crates/smith-cli/src/watch.rs`) owns stdin in raw mode only while a turn runs and restores it
+  on drop; frontends map the first Esc to `Pause` and the second to `Cancel`.
 - Declare user-facing settings in `Config` and `FileConfig`, and consume them by field. The only
   direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`)
   and environment-only secrets (`api_key_env`). All other settings are read from `Config`.
@@ -143,14 +155,16 @@ Extension workflows:
 
 ## Tests
 
-The test suite runs with `cargo test`. It must stay offline.
+The default test run is `cargo test` and must stay offline. The sandbox's container test is
+ignored; it needs podman, a built worker and network.
 
 - Unit tests are in a `#[cfg(test)] mod tests` in the module they exercise. Integration tests
   are in `crates/<crate>/tests/` and cover behavior the public API exposes across module
   boundaries. Examples include wire parsing over recorded fixtures and HTTP routing.
 - `MockProvider` is the scripted provider. Queue turns with `push_text`, `push_events`,
   `push_stalling_text` or `push_error`, then assert on `requests()`. Tests use it to exercise
-  the session, CLI rendering and web API without a network.
+  the session, CLI rendering and web API without a network. `MockTool` is the scripted tool; it
+  records its arguments and returns a fixed result or message.
 - Wire-format tests replay the recorded SSE captures in
   `crates/smith-providers/tests/fixtures/` through the same parser the live stream uses. Do not
   hand-write provider JSON. Record a new fixture when the real format changes.
@@ -196,14 +210,22 @@ Where a test goes:
 
 ## Unsafe code
 
-The workspace lints set `unsafe_code = "forbid"`. Every crate sets `[lints] workspace = true`.
-Do not add `unsafe`. Do not remove the workspace lint or override its level in a crate.
+The workspace lints set `unsafe_code = "deny"`. Every crate sets `[lints] workspace = true`.
+Unsafe code is an error unless the item carries an explicit `#[allow(unsafe_code)]`.
 
-If a change appears to require `unsafe`, stop and discuss it with the developer before making
-the change. An approved exception is an explicit policy change. It does not belong in an
-unrelated change. If the developer approves one, document the invariant with a `// SAFETY:`
-comment and add a test that exercises the block. Run that test under Miri or a sanitizer, using
-a scratch nightly toolchain rather than changing `rust-toolchain.toml`.
+There is one approved exception, in `crates/smith-worker/src/main.rs`: adopting descriptor 3,
+the inherited end of the channel socketpair. It exists because Rust has no safe conversion from
+a descriptor number received across `exec` to an owner, and it is written as a borrow followed
+immediately by `dup`, so nothing owns descriptor 3 and no drop can close a recycled number. The
+item carries a `// SAFETY:` comment stating the contract, and binary tests start the worker
+with descriptor 3 closed, with descriptor 3 not a socket, and with a socket on descriptor 3.
+
+A new exception is a policy change, and it does not belong in an unrelated change. If a change
+appears to require `unsafe`, stop and discuss it with the developer first. Document the
+invariant with a `// SAFETY:` comment and add a test that exercises the block. Run what can run
+under Miri or a sanitizer on a scratch nightly toolchain rather than changing
+`rust-toolchain.toml`. Descriptor adoption across `exec` is outside what Miri models, so that
+exception is covered by tests.
 
 ## Technical writing
 
@@ -253,21 +275,33 @@ update the README in the same change. Keep quoted error text identical to what t
 
 ## Git conventions
 
-Do not create commits or perform any other git history manipulation unless the user explicitly
-prompts for it. This includes `git commit`, `git commit --amend`, `git rebase`, `git reset`,
-`git cherry-pick` and `git merge`. Do not switch or create branches. Do not push unless
-explicitly prompted.
+Tracked changes are made in a git worktree, never in the primary checkout. The primary
+checkout is the integration point: it stays on `main`, and the developer merges there.
 
-The repository is kept at a single commit (`initial commit`). When the user asks for a change to
-be recorded, amend that commit instead of adding history.
-
-Commit messages follow these patterns:
-- For the subject line, use sentence case with a present-tense verb (for example, "Add" or
-  "Fix"). The subject line does not end with a period.
-- Prefer a brief explanatory body after the subject line. Describe why the change was made.
-  Summarize what changed. Keep the body concise and free-form.
-- For non-trivial commits, write the message to a temporary file first to check formatting
-  before committing. Aim for approximately 80-90 columns in commit message prose.
+- Check the current root before editing. `git rev-parse --show-toplevel` names it, and
+  `git worktree list` shows every worktree; the primary checkout is the first entry. If the
+  root is the primary checkout, create a worktree instead of editing.
+- Create one worktree per task, from the primary checkout:
+  `git worktree add .worktrees/<task> -b <task>`. Worktrees live under `.worktrees/` in the
+  repository root, which `.gitignore` excludes, so `git status` and tools that respect ignore
+  files skip them. Omit `-b` when the branch already exists.
+- One branch and one task per worktree. Do not switch branches inside a worktree, and do not
+  check out a branch that another worktree already holds. The sandbox mounts the workspace
+  root, so a session started in the primary checkout can also see the worktrees under
+  `.worktrees/`; do not treat that visibility as permission to edit them.
+- `plans/` is ignored by git and exists only in the primary checkout. Design documents are
+  read and written there, not in a worktree. This is the one exception to editing the primary
+  checkout, and it touches no tracked file.
+- Do not commit, amend, rebase, cherry-pick, merge or push unless the user explicitly asks.
+  When they ask, commit on the worktree's branch. Git history is the developer's decision.
+- When a task is finished, leave the worktree in place for review. Remove only a worktree you
+  created, and only after its branch is merged or abandoned:
+  `git worktree remove .worktrees/<task>` and `git branch -d <task>`.
+- `git worktree prune` clears records for worktrees whose directory was deleted by hand. It is
+  not routine cleanup.
+- Commit messages use sentence case with a present-tense verb in the subject line, no trailing
+  period, and a short body that says why. Write a non-trivial message to a temporary file
+  first to check its formatting.
 
 ## Dependencies
 
@@ -281,6 +315,13 @@ The dependency direction is an architecture rule:
 - `smith-core` must never gain a network, terminal or HTTP crate. Check with
   `cargo tree -p smith-core -e normal | grep -E 'reqwest|hyper|axum|clap|rustyline'`, which must
   print nothing.
+- `smith-worker` must never gain a network client, an HTTP server, a terminal library or the
+  sandbox supervisor. Check with
+  `cargo tree -p smith-worker -e normal | grep -E 'reqwest|hyper|axum|clap|rustyline'`, which
+  must print nothing.
+- `smith-sandbox` talks to podman through `tokio::process`, maps the channel descriptor with
+  `command-fds` and leaves the descriptor arithmetic to `nix`. `smith-channel` depends only on
+  `serde` and `serde_json`, so the worker links a small static binary.
 - `smith-providers` is the only crate that performs network I/O in production. It uses
   `reqwest`. `smith-web` uses `reqwest` only as a dev-dependency for its HTTP tests.
 - `smith-web` is the only crate with a browser-facing stack (`axum`).

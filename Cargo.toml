@@ -1,8 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/smith-channel",
     "crates/smith-core",
     "crates/smith-providers",
+    "crates/smith-sandbox",
+    "crates/smith-worker",
     "crates/smith-cli",
     "crates/smith-web",
 ]
@@ -13,8 +16,10 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+smith-channel = { path = "crates/smith-channel" }
 smith-core = { path = "crates/smith-core" }
 smith-providers = { path = "crates/smith-providers" }
+smith-sandbox = { path = "crates/smith-sandbox" }
 smith-web = { path = "crates/smith-web" }
 
 tokio = { version = "1.36", features = [
@@ -42,6 +47,16 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# Safe wrappers for the few process and descriptor operations the sandbox needs. Using `nix`
+# keeps `unsafe` out of the tree, which the workspace lint forbids.
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "user"] }
+# Maps the channel socketpair to descriptor 3 in the podman client. POSIX `sh` accepts only
+# single-digit descriptor numbers in redirections, and the socket end is often above 9.
+command-fds = { version = "0.3", features = ["tokio"] }
+tempfile = "3"
+# The project config is keyed by a hash of the canonical workspace root.
+sha2 = "0.10"
+
 # The web server's stack. This is the only place a browser-facing dependency is allowed.
 # smith-core must stay free of it.
 axum = { version = "0.8", features = ["json"] }
@@ -49,7 +64,8 @@ axum = { version = "0.8", features = ["json"] }
 getrandom = "0.2"
 tower = { version = "0.5", features = ["util"] }
 
-# `unsafe` is forbidden in every crate. A change that appears to need it requires a
-# conversation with the developer, not a lint override.
+# `unsafe` is denied in every crate. One approved exception adopts the inherited channel
+# descriptor in `smith-worker`; it carries an item-level allow and a SAFETY comment. A new
+# exception is a policy change, not a lint override.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

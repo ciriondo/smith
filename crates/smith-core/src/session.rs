@@ -7,8 +7,9 @@
 //! Three rules apply here:
 //!
 //! * **Deltas are never persisted.** The transcript gains the user message and the assistant
-//!   message exactly once, when a turn finishes. A failed or cancelled turn leaves the
-//!   transcript untouched, so the model never sees a partial answer.
+//!   message exactly once, when a turn finishes or pauses. A failed or cancelled turn leaves
+//!   the transcript untouched, so the model never sees a partial answer. A paused turn keeps
+//!   the steps that completed before the boundary.
 //! * **`Send` while a turn is running is rejected**, not queued.
 //! * **[`SessionHandle::subscribe`] subscribes before it snapshots**, and
 //!   [`Subscription::recv`] drops events that were already replayed. The opposite order
@@ -16,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,10 +26,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{run_turn, ToolArgError};
-use crate::error::{ProviderError, SmithError};
+use crate::agent::{run_agent, AgentError, AgentEvent, AgentOutcome, PauseToken, ToolArgError};
+use crate::error::SmithError;
 use crate::message::{Message, Usage};
-use crate::provider::{ChatRequest, Provider, ProviderEvent, ToolSpec};
+use crate::provider::{ChatRequest, Provider, ProviderEvent};
+use crate::tools::Tool;
 
 /// Replay buffer cap per session. A reconnecting client can resume from this buffer.
 const BACKLOG_CAP: usize = 1000;
@@ -94,7 +97,9 @@ pub enum Command {
     /// Send a user message. Rejected with [`UiEventKind::SendRejected`] if a turn is already
     /// running.
     Send { text: String },
-    /// Cancel the running turn, whichever frontend asked for it.
+    /// Stop the running turn at its next provider-request boundary. Ignored when idle.
+    Pause,
+    /// Cancel the running turn immediately, whichever frontend asked for it.
     Cancel,
     /// Ask for the transcript. This is answered during a turn as well, so a reconnecting
     /// frontend can re-fetch what it missed rather than reconnecting without state.
@@ -153,14 +158,39 @@ pub enum UiEventKind {
         /// failure is recoverable.
         tool_arg_errors: Vec<ToolArgError>,
     },
+    /// The turn stopped at a provider-request boundary. The transcript already holds the
+    /// steps that completed before it.
+    TurnPaused {
+        usage: Usage,
+        tool_arg_errors: Vec<ToolArgError>,
+    },
     TurnFailed {
         message: String,
     },
     Cancelled,
+    /// A pause request was accepted for the running turn. Emitted once per turn so every
+    /// frontend can show the pending state.
+    PauseRequested,
     /// A `Send` arrived while a turn was running. Two frontends can race the busy check, so
     /// the actor reports the rejection instead of assuming the frontend knows.
     SendRejected {
         prompt: String,
+    },
+    /// A tool call started. `summary` is one line built from the arguments, so frontends do
+    /// not parse tool-specific JSON.
+    ToolStarted {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    /// A tool call finished. `summary` describes the outcome, for example `exit 0`.
+    ToolFinished {
+        call_id: String,
+        name: String,
+        ok: bool,
+        duration_ms: u64,
+        truncated: bool,
+        summary: String,
     },
 }
 
@@ -173,9 +203,13 @@ impl UiEventKind {
             UiEventKind::ReasoningDelta { .. } => "reasoning_delta",
             UiEventKind::Usage { .. } => "usage",
             UiEventKind::TurnFinished { .. } => "turn_finished",
+            UiEventKind::TurnPaused { .. } => "turn_paused",
             UiEventKind::TurnFailed { .. } => "turn_failed",
             UiEventKind::Cancelled => "cancelled",
+            UiEventKind::PauseRequested => "pause_requested",
             UiEventKind::SendRejected { .. } => "send_rejected",
+            UiEventKind::ToolStarted { .. } => "tool_started",
+            UiEventKind::ToolFinished { .. } => "tool_finished",
         }
     }
 }
@@ -261,12 +295,39 @@ impl Subscription {
 }
 
 /// Configuration that does not change per turn.
+type ToolFactory = Arc<dyn Fn(&SessionId) -> Vec<Arc<dyn Tool>> + Send + Sync>;
+
+/// How a session obtains its tools. The sandbox needs the session id in the container label,
+/// so it supplies a factory rather than one fixed list.
+#[derive(Clone)]
+pub enum ToolSet {
+    Fixed(Vec<Arc<dyn Tool>>),
+    Factory(ToolFactory),
+}
+
+impl ToolSet {
+    fn build(&self, id: &SessionId) -> Vec<Arc<dyn Tool>> {
+        match self {
+            ToolSet::Fixed(tools) => tools.clone(),
+            ToolSet::Factory(factory) => factory(id),
+        }
+    }
+}
+
+impl From<Vec<Arc<dyn Tool>>> for ToolSet {
+    fn from(tools: Vec<Arc<dyn Tool>>) -> Self {
+        ToolSet::Fixed(tools)
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionConfig {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub system: Option<String>,
-    pub tools: Vec<ToolSpec>,
+    pub tools: ToolSet,
+    /// Canonical workspace root. Every tool call receives it.
+    pub workspace: PathBuf,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
@@ -304,6 +365,27 @@ impl SessionHandle {
             .send(Command::Cancel)
             .await
             .map_err(|_| self.closed())
+    }
+
+    /// Ask the running turn to stop at its next provider-request boundary.
+    pub async fn pause(&self) -> Result<(), SmithError> {
+        self.tx
+            .send(Command::Pause)
+            .await
+            .map_err(|_| self.closed())
+    }
+
+    /// A pause request from a thread that is not running a Tokio runtime.
+    ///
+    /// The terminal watcher uses this. Returns false when the command queue is full or the
+    /// actor is gone, so the caller can keep the next key as a pause rather than escalate.
+    pub fn pause_now(&self) -> bool {
+        self.tx.try_send(Command::Pause).is_ok()
+    }
+
+    /// A cancel request from a thread that is not running a Tokio runtime.
+    pub fn cancel_now(&self) -> bool {
+        self.tx.try_send(Command::Cancel).is_ok()
     }
 
     /// The transcript at this moment. This is answered mid-turn too.
@@ -356,12 +438,14 @@ impl SessionManager {
         let backlog = Arc::new(Mutex::new(VecDeque::new()));
         let busy = Arc::new(AtomicBool::new(false));
 
+        let tools = self.config.tools.build(&id);
         let actor = Actor {
             id: id.clone(),
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
             system: self.config.system.clone(),
-            tools: self.config.tools.clone(),
+            tools,
+            workspace: self.config.workspace.clone(),
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             transcript: Vec::new(),
@@ -370,6 +454,7 @@ impl SessionManager {
             backlog: backlog.clone(),
             busy: busy.clone(),
             cancel: CancellationToken::new(),
+            pause: PauseToken::default(),
         };
         tokio::spawn(actor.run(rx));
 
@@ -403,7 +488,8 @@ struct Actor {
     provider: Arc<dyn Provider>,
     model: String,
     system: Option<String>,
-    tools: Vec<ToolSpec>,
+    tools: Vec<Arc<dyn Tool>>,
+    workspace: PathBuf,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     transcript: Vec<Message>,
@@ -412,6 +498,7 @@ struct Actor {
     backlog: Arc<Mutex<VecDeque<UiEvent>>>,
     busy: Arc<AtomicBool>,
     cancel: CancellationToken,
+    pause: PauseToken,
 }
 
 impl Actor {
@@ -419,9 +506,10 @@ impl Actor {
         while let Some(cmd) = cmds.recv().await {
             match cmd {
                 Command::Send { text } => self.turn(text, &mut cmds).await,
-                // A `Cancel` with nothing in flight is a no-op, not an error: Ctrl-C at the
-                // prompt, or a UI button pressed a moment too late, must be harmless.
-                Command::Cancel => {}
+                // A `Cancel` or `Pause` with nothing in flight is a no-op, not an error:
+                // Ctrl-C at the prompt, or a UI button pressed a moment too late, must be
+                // harmless.
+                Command::Cancel | Command::Pause => {}
                 Command::Snapshot { reply } => {
                     let _ = reply.send(self.snapshot());
                 }
@@ -433,6 +521,11 @@ impl Actor {
         self.busy.store(true, Ordering::SeqCst);
         let cancel = CancellationToken::new();
         self.cancel = cancel.clone();
+        self.pause.clear();
+
+        for tool in &self.tools {
+            tool.set_busy(true);
+        }
 
         self.emit(UiEventKind::TurnStarted {
             prompt: prompt.clone(),
@@ -442,7 +535,6 @@ impl Actor {
         messages.push(Message::user(prompt.clone()));
         let mut request = ChatRequest::new(&self.model, messages, self.id.as_str());
         request.system = self.system.clone();
-        request.tools = self.tools.clone();
         request.max_tokens = self.max_tokens;
         request.temperature = self.temperature;
 
@@ -451,14 +543,26 @@ impl Actor {
         // The event channel is unbounded so the producer never blocks on a slow renderer.
         // The broadcast channel is bounded, and a lagging client receives `SubError::Lagged`
         // instead of stalling the session.
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<ProviderEvent>();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (done_tx, mut done_rx) = oneshot::channel();
         let provider = self.provider.clone();
+        let tools = self.tools.clone();
+        let workspace = self.workspace.clone();
+        let pause = self.pause.clone();
         tokio::spawn(async move {
-            let mut forward = |event: &ProviderEvent| {
-                let _ = ev_tx.send(event.clone());
+            let mut forward = |event: AgentEvent| {
+                let _ = ev_tx.send(event);
             };
-            let result = run_turn(provider.as_ref(), request, cancel, &mut forward).await;
+            let result = run_agent(
+                provider.as_ref(),
+                &tools,
+                &workspace,
+                request,
+                pause,
+                cancel,
+                &mut forward,
+            )
+            .await;
             let _ = done_tx.send(result);
         });
 
@@ -468,6 +572,12 @@ impl Actor {
             tokio::select! {
                 cmd = cmds.recv(), if commands_open => match cmd {
                     Some(Command::Cancel) => self.cancel.cancel(),
+                    Some(Command::Pause) => {
+                        if !self.pause.is_requested() {
+                            self.pause.request();
+                            self.emit(UiEventKind::PauseRequested);
+                        }
+                    }
                     Some(Command::Send { text }) => {
                         self.emit(UiEventKind::SendRejected { prompt: text });
                     }
@@ -498,25 +608,47 @@ impl Actor {
         match result {
             // The transcript is extended only here. A turn that produced no message does not
             // appear, so the next request cannot contain a partial answer.
-            Ok(Ok(turn)) => {
-                self.transcript.push(Message::user(prompt));
-                self.transcript.push(turn.message.clone());
-                self.emit(UiEventKind::TurnFinished {
-                    message: turn.message,
-                    usage: turn.usage,
-                    tool_arg_errors: turn.tool_arg_errors,
-                });
+            Ok(Ok(AgentOutcome {
+                added,
+                final_message,
+                usage,
+                tool_arg_errors,
+                paused,
+            })) => {
+                // A paused turn keeps the steps that completed before the boundary. An
+                // empty pause (no request ran) records nothing, including the prompt.
+                if paused {
+                    if !added.is_empty() {
+                        self.transcript.push(Message::user(prompt));
+                        self.transcript.extend(added);
+                    }
+                    self.emit(UiEventKind::TurnPaused {
+                        usage,
+                        tool_arg_errors,
+                    });
+                } else {
+                    let final_message =
+                        final_message.expect("a completed turn has an assistant message");
+                    self.transcript.push(Message::user(prompt));
+                    self.transcript.extend(added);
+                    self.emit(UiEventKind::TurnFinished {
+                        message: final_message,
+                        usage,
+                        tool_arg_errors,
+                    });
+                }
             }
-            Ok(Err(ProviderError::Cancelled)) => self.emit(UiEventKind::Cancelled),
-            Ok(Err(e)) => self.emit(UiEventKind::TurnFailed {
-                message: e.to_string(),
-            }),
+            Ok(Err(AgentError::Cancelled)) => self.emit(UiEventKind::Cancelled),
+            Ok(Err(AgentError::Failed(message))) => self.emit(UiEventKind::TurnFailed { message }),
             // The turn task itself died, which means it panicked.
             Err(_) => self.emit(UiEventKind::TurnFailed {
                 message: "the turn ended unexpectedly".to_string(),
             }),
         }
 
+        for tool in &self.tools {
+            tool.set_busy(false);
+        }
         self.busy.store(false, Ordering::SeqCst);
     }
 
@@ -531,16 +663,42 @@ impl Actor {
 
     /// Forward the events a frontend can render. Tool-call fragments and `finish_reason` are
     /// internal, and the assembled result arrives with `TurnFinished`.
-    fn forward(&mut self, event: &ProviderEvent) {
+    fn forward(&mut self, event: &AgentEvent) {
         match event {
-            ProviderEvent::TextDelta(text) => {
+            AgentEvent::Provider(ProviderEvent::TextDelta(text)) => {
                 self.emit(UiEventKind::TextDelta { text: text.clone() })
             }
-            ProviderEvent::ReasoningDelta(text) => {
+            AgentEvent::Provider(ProviderEvent::ReasoningDelta(text)) => {
                 self.emit(UiEventKind::ReasoningDelta { text: text.clone() })
             }
-            ProviderEvent::Usage(usage) => self.emit(UiEventKind::Usage { usage: *usage }),
-            ProviderEvent::ToolCallDelta { .. } | ProviderEvent::Done { .. } => {}
+            AgentEvent::Provider(ProviderEvent::Usage(usage)) => {
+                self.emit(UiEventKind::Usage { usage: *usage })
+            }
+            AgentEvent::Provider(_) => {}
+            AgentEvent::ToolStarted {
+                call_id,
+                name,
+                summary,
+            } => self.emit(UiEventKind::ToolStarted {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+            }),
+            AgentEvent::ToolFinished {
+                call_id,
+                name,
+                ok,
+                duration_ms,
+                truncated,
+                summary,
+            } => self.emit(UiEventKind::ToolFinished {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                ok: *ok,
+                duration_ms: *duration_ms,
+                truncated: *truncated,
+                summary: summary.clone(),
+            }),
         }
     }
 
@@ -566,8 +724,15 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::MockProvider;
+    use crate::error::ProviderError;
+    use crate::message::{ContentBlock, StopReason};
+    use crate::mock::{MockProvider, MockTool};
+    use crate::provider::{ProviderEvent, ToolSpec};
+    use crate::tools::{Tool, ToolContext, ToolError};
+    use futures_util::future::BoxFuture;
+    use serde_json::Value;
     use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -576,11 +741,108 @@ mod tests {
             provider: provider.clone(),
             model: "mock-1".to_string(),
             system: Some("be brief".to_string()),
-            tools: Vec::new(),
+            tools: Vec::new().into(),
+            workspace: std::env::temp_dir(),
             max_tokens: None,
             temperature: None,
         });
         (provider, mgr)
+    }
+
+    fn manager_with_tools(
+        provider: Arc<MockProvider>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> SessionManager {
+        SessionManager::new(SessionConfig {
+            provider,
+            model: "mock-1".to_string(),
+            system: Some("be brief".to_string()),
+            tools: tools.into(),
+            workspace: std::env::temp_dir(),
+            max_tokens: None,
+            temperature: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_turn_runs_tool_calls_and_calls_the_provider_again() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("read_file".to_string()),
+                args_delta: "{\"path\":\"a.txt\"}".to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("all done");
+
+        let mock = Arc::new(MockTool::new(
+            "read_file",
+            "{\"content\":\"hi\",\"truncated\":false}",
+        ));
+        let manager = manager_with_tools(provider.clone(), vec![mock.clone() as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut subscription = session.subscribe();
+
+        session.send("read it").await.unwrap();
+        let (seen, terminal) = drain_until_terminal(&mut subscription).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+
+        let started = seen
+            .iter()
+            .position(|event| matches!(event.kind, UiEventKind::ToolStarted { .. }))
+            .expect("a tool_started event");
+        let finished = seen
+            .iter()
+            .position(|event| matches!(event.kind, UiEventKind::ToolFinished { .. }))
+            .expect("a tool_finished event");
+        assert!(started < finished);
+
+        assert_eq!(mock.calls(), vec![serde_json::json!({"path": "a.txt"})]);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "the provider is called once per step");
+        let has_result = requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        });
+        assert!(has_result, "the second request carries the tool result");
+
+        let snapshot = session.snapshot().await.unwrap();
+        assert_eq!(snapshot.transcript.len(), 4, "user, call, result, answer");
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_does_not_fail_the_turn() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("read_file".to_string()),
+                args_delta: "{}".to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("recovered");
+
+        let mock = Arc::new(MockTool::failing("read_file", "no such file"));
+        let manager = manager_with_tools(provider.clone(), vec![mock.clone() as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut subscription = session.subscribe();
+
+        session.send("go").await.unwrap();
+        let (_, terminal) = drain_until_terminal(&mut subscription).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+        assert_eq!(provider.requests().len(), 2);
     }
 
     /// Read events until the turn ends, returning everything read and the terminal event.
@@ -594,6 +856,7 @@ mod tests {
             let terminal = matches!(
                 event.kind,
                 UiEventKind::TurnFinished { .. }
+                    | UiEventKind::TurnPaused { .. }
                     | UiEventKind::TurnFailed { .. }
                     | UiEventKind::Cancelled
             );
@@ -638,6 +901,7 @@ mod tests {
             if matches!(
                 event.kind,
                 UiEventKind::TurnFinished { .. }
+                    | UiEventKind::TurnPaused { .. }
                     | UiEventKind::TurnFailed { .. }
                     | UiEventKind::Cancelled
             ) {
@@ -918,6 +1182,202 @@ mod tests {
             until_terminal(&mut session.subscribe()).await.kind,
             UiEventKind::TurnFinished { .. }
         ));
+    }
+
+    /// A tool whose call blocks until the test releases it. Pausing while a tool runs is the
+    /// case the pause boundary has to handle.
+    struct BlockingTool {
+        name: String,
+        calls: Mutex<Vec<Value>>,
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl BlockingTool {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                calls: Mutex::new(Vec::new()),
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+            }
+        }
+
+        fn calls(&self) -> Vec<Value> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Tool for BlockingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.clone(),
+                description: "a tool that blocks until released".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call<'a>(
+            &'a self,
+            args: Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<String, ToolError>> {
+            self.calls.lock().unwrap().push(args);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.map_err(|_| {
+                    ToolError::Message("the test tool lost its release channel".to_string())
+                })?;
+                Ok("{\"content\":\"blocked\"}".to_string())
+            })
+        }
+    }
+
+    fn tool_call_event(id: &str, name: &str, args: &str) -> ProviderEvent {
+        ProviderEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            args_delta: args.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pause_after_a_tool_batch_records_the_steps_and_stops() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            tool_call_event("call_1", "blocking", "{}"),
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("after steering");
+        let tool = Arc::new(BlockingTool::new("blocking"));
+        let manager = manager_with_tools(provider.clone(), vec![tool.clone() as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut sub = session.subscribe();
+
+        session.send("go").await.unwrap();
+        tool.started.acquire().await.unwrap().forget();
+        session.pause().await.unwrap();
+        tool.release.add_permits(1);
+
+        let (seen, terminal) = drain_until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnPaused { .. }));
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event.kind, UiEventKind::PauseRequested)),
+            "the frontend must learn that a pause was accepted"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "the next provider request is not sent after a pause"
+        );
+
+        let snapshot = session.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.transcript.len(),
+            3,
+            "user, assistant call and tool result"
+        );
+        assert_eq!(tool.calls().len(), 1);
+
+        session.send("steer").await.unwrap();
+        let terminal = until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].messages.len(),
+            4,
+            "the paused steps plus the steering message"
+        );
+        assert!(
+            requests[1].messages.iter().any(|message| message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))),
+            "the steering request carries the recorded tool result"
+        );
+        assert_eq!(requests[1].messages.last().unwrap().text(), "steer");
+    }
+
+    #[tokio::test]
+    async fn repeated_pause_commands_emit_one_pause_requested() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            tool_call_event("call_1", "blocking", "{}"),
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let tool = Arc::new(BlockingTool::new("blocking"));
+        let manager = manager_with_tools(provider, vec![tool.clone() as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut sub = session.subscribe();
+
+        session.send("go").await.unwrap();
+        tool.started.acquire().await.unwrap().forget();
+        session.pause().await.unwrap();
+        session.pause().await.unwrap();
+        tool.release.add_permits(1);
+
+        let (seen, terminal) = drain_until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnPaused { .. }));
+        let count = seen
+            .iter()
+            .filter(|event| matches!(event.kind, UiEventKind::PauseRequested))
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_a_pause_is_pending_discards_the_turn() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            tool_call_event("call_1", "blocking", "{}"),
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        let tool = Arc::new(BlockingTool::new("blocking"));
+        let manager = manager_with_tools(provider.clone(), vec![tool.clone() as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut sub = session.subscribe();
+
+        session.send("go").await.unwrap();
+        tool.started.acquire().await.unwrap().forget();
+        session.pause().await.unwrap();
+        session.cancel().await.unwrap();
+        tool.release.add_permits(1);
+
+        let terminal = until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::Cancelled));
+        let snapshot = session.snapshot().await.unwrap();
+        assert!(
+            snapshot.transcript.is_empty(),
+            "a cancelled turn is not recorded, even after a pause request"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_when_idle_does_not_disturb_the_next_turn() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_text("ok");
+        let session = manager(provider).1.create();
+
+        session.pause().await.unwrap();
+        session.send("go").await.unwrap();
+        let mut sub = session.subscribe();
+        let terminal = until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+        let snapshot = session.snapshot().await.unwrap();
+        assert_eq!(snapshot.transcript.len(), 2);
     }
 
     #[tokio::test]

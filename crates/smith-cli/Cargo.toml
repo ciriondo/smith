@@ -10,12 +10,17 @@ path = "src/main.rs"
 
 [dependencies]
 smith-core.workspace = true
+smith-sandbox.workspace = true
 smith-providers.workspace = true
 smith-web.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+nix = { workspace = true, features = ["poll", "term"] }
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

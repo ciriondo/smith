@@ -7,11 +7,14 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use futures_util::future::BoxFuture;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ProviderError;
 use crate::message::StopReason;
-use crate::provider::{ChatRequest, ModelInfo, Provider, ProviderEvent, ProviderStream};
+use crate::provider::{ChatRequest, ModelInfo, Provider, ProviderEvent, ProviderStream, ToolSpec};
+use crate::tools::{Tool, ToolContext, ToolError};
 
 /// One scripted turn.
 enum MockTurn {
@@ -141,6 +144,75 @@ impl Provider for MockProvider {
                 },
             )),
         }
+    }
+}
+
+/// A [`Tool`] with a scripted result, for loop tests. It records every argument object it is
+/// called with.
+pub struct MockTool {
+    name: String,
+    result: Result<String, ToolError>,
+    prepared: Option<String>,
+    calls: Mutex<Vec<Value>>,
+}
+
+impl MockTool {
+    pub fn new(name: impl Into<String>, result: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            result: Ok(result.into()),
+            prepared: None,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A tool that answers with a message for the model.
+    pub fn failing(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            result: Err(ToolError::Message(message.into())),
+            prepared: None,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A tool whose `prepare` returns this sentence for the system prompt.
+    pub fn with_prepare(mut self, sentence: impl Into<String>) -> Self {
+        self.prepared = Some(sentence.into());
+        self
+    }
+
+    pub fn calls(&self) -> Vec<Value> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Tool for MockTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "a scripted tool".to_string(),
+            schema: serde_json::json!({"type": "object", "additionalProperties": false}),
+        }
+    }
+
+    fn prepare<'a>(&'a self) -> BoxFuture<'a, Result<Option<String>, ToolError>> {
+        let prepared = self.prepared.clone();
+        Box::pin(async move { Ok(prepared) })
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<String, ToolError>> {
+        self.calls.lock().unwrap().push(args);
+        let result = self.result.clone();
+        Box::pin(async move { result })
     }
 }
 

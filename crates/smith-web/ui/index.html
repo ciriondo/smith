@@ -17,7 +17,12 @@
 <main id="main">
   <header id="header">
     <span id="session-id" class="muted">no session selected</span>
-    <button id="cancel" disabled>Cancel</button>
+    <div class="actions">
+      <span class="hint">esc pause · esc esc terminate</span>
+      <button id="stop" disabled
+              title="Pause after the current step (Esc). Click again to terminate (Esc Esc)."
+              aria-label="Pause after the current step (Esc)">Pause</button>
+    </div>
   </header>
 
   <ol id="transcript"></ol>

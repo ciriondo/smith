@@ -92,6 +92,23 @@ pub async fn send_message(
     }
 }
 
+pub async fn pause_turn(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(session) = state.sessions().get(&id) else {
+        return unknown_session(&id);
+    };
+
+    // Pausing when nothing runs is explicitly not an error; the button is disabled, but a
+    // racing request or a second frontend may still send it.
+    match session.pause().await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": if session.is_busy() { "pausing" } else { "idle" } })),
+        )
+            .into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
 pub async fn cancel_turn(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(session) = state.sessions().get(&id) else {
         return unknown_session(&id);

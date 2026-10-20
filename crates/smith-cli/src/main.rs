@@ -4,6 +4,8 @@
 //! [`UiEvent`]s it receives. It holds no conversation state. The same session layer supports
 //! the web server.
 
+mod watch;
+
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -13,7 +15,9 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 
 use smith_core::config::Config;
-use smith_core::session::{SessionConfig, SessionHandle, SessionManager, SubError, Subscription};
+use smith_core::session::{
+    SessionConfig, SessionHandle, SessionManager, SubError, Subscription, ToolSet,
+};
 use smith_core::{SmithError, UiEventKind};
 
 /// Exit codes. `-p` mode is used by scripts, so these values are part of the contract.
@@ -55,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         command: ProvidersCommand,
     },
+    /// Inspect and clean up smith's sandbox containers.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
 
     /// Serve the web UI on localhost: the same sessions, rendered in a browser.
     Serve(ServeArgs),
@@ -84,6 +93,16 @@ enum ProvidersCommand {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum SandboxCommand {
+    /// List smith's containers, including ones left by a crashed process.
+    Ps,
+    /// Stop a container by id or name.
+    Stop { container: String },
+    /// Remove a container by id or name.
+    Rm { container: String },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Runtime::new() {
@@ -97,7 +116,18 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> ExitCode {
-    let config = match Config::load(cli.config.as_deref()) {
+    let workspace = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("smith: cannot resolve the workspace: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match cli.config.as_deref() {
+        Some(path) => Config::load(Some(path)),
+        None => Config::load_for_workspace(&workspace),
+    };
+    let config = match config {
         Ok(c) => c,
         Err(e) => {
             eprintln!("smith: {e}");
@@ -111,6 +141,9 @@ async fn run(cli: Cli) -> ExitCode {
         }) => {
             list_providers(&config);
             return ExitCode::SUCCESS;
+        }
+        Some(Command::Sandbox { command }) => {
+            return run_sandbox(command).await;
         }
         Some(Command::Serve(args)) => {
             return serve(
@@ -162,15 +195,70 @@ fn build_manager(
     let provider_cfg = config.provider(&model.provider)?;
     let provider = smith_providers::build(&model.provider, provider_cfg)?;
 
+    let workspace = std::env::current_dir()
+        .map_err(|e| SmithError::Config(format!("cannot resolve the workspace: {e}")))?;
+
+    let supervisor =
+        Arc::new(smith_sandbox::Supervisor::new().map_err(|e| SmithError::Config(e.to_string()))?);
+    let settings = config.sandbox.clone();
+    let sandbox_workspace = workspace.clone();
+    let factory = move |id: &smith_core::SessionId| {
+        let sandbox = smith_sandbox::SandboxConfig {
+            workspace: sandbox_workspace.clone(),
+            session: id.as_str().to_string(),
+            allow: settings.allow.clone(),
+            ro_mounts: settings.ro_mounts.clone(),
+            env: smith_sandbox::standard_env(&settings),
+            idle_timeout: settings.idle_timeout,
+        };
+        smith_sandbox::sandbox_tools(supervisor.clone(), sandbox)
+    };
+
     Ok(SessionManager::new(SessionConfig {
         provider,
         model: model.model,
         system: system_flag.or_else(|| config.system_prompt.clone()),
-        // Tools are not implemented, so this list stays empty.
-        tools: Vec::new(),
+        tools: ToolSet::Factory(Arc::new(factory)),
+        workspace,
         max_tokens: config.max_tokens,
         temperature: config.temperature,
     }))
+}
+
+/// `smith sandbox ps|stop|rm`. These commands do not need a model or a worker binary.
+async fn run_sandbox(command: SandboxCommand) -> ExitCode {
+    let supervisor = match smith_sandbox::Supervisor::new() {
+        Ok(supervisor) => supervisor,
+        Err(e) => {
+            eprintln!("smith: sandbox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = match command {
+        SandboxCommand::Ps => match supervisor.list().await {
+            Ok(list) if list.trim().is_empty() => {
+                println!("no containers in {}", supervisor.store().display());
+                Ok(())
+            }
+            Ok(list) => {
+                println!("{}", list.trim_end());
+                println!("store: {}", supervisor.store().display());
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        SandboxCommand::Stop { container } => supervisor.stop(&container).await,
+        SandboxCommand::Rm { container } => supervisor.remove(&container).await,
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("smith: sandbox: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Run the web frontend: the same core rendered in a browser instead of a terminal.
@@ -397,6 +485,35 @@ async fn render_turn<W: Write, E: Write>(
                 let _ = err.flush();
                 return EXIT_OK;
             }
+            UiEventKind::TurnPaused {
+                usage,
+                tool_arg_errors,
+            } => {
+                if reasoning_shown {
+                    let _ = write!(err, "\x1b[0m");
+                }
+                if streamed_any {
+                    let _ = writeln!(out);
+                }
+                for failure in &tool_arg_errors {
+                    let _ = writeln!(
+                        err,
+                        "smith: model sent unparseable arguments for {}: {}",
+                        failure.tool, failure.message
+                    );
+                }
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    let _ = writeln!(
+                        err,
+                        "smith: {} in / {} out tokens",
+                        usage.input_tokens, usage.output_tokens
+                    );
+                }
+                let _ = writeln!(err, "smith: paused after the current step");
+                let _ = out.flush();
+                let _ = err.flush();
+                return EXIT_OK;
+            }
             UiEventKind::TurnFailed { message } => {
                 if reasoning_shown {
                     let _ = write!(err, "\x1b[0m");
@@ -408,6 +525,10 @@ async fn render_turn<W: Write, E: Write>(
                 let _ = out.flush();
                 let _ = err.flush();
                 return EXIT_FAILED;
+            }
+            UiEventKind::PauseRequested => {
+                let _ = writeln!(err, "smith: pausing... (esc again to terminate)");
+                let _ = err.flush();
             }
             UiEventKind::Cancelled => {
                 if reasoning_shown {
@@ -441,6 +562,17 @@ async fn render_turn<W: Write, E: Write>(
                     "smith: another frontend sent {rejected:?} while a turn was running"
                 );
             }
+            // The started line is redundant in a terminal: the finished line names the tool
+            // and its outcome. Both modes therefore print one line per call, to stderr.
+            UiEventKind::ToolStarted { .. } => {}
+            UiEventKind::ToolFinished {
+                name,
+                duration_ms,
+                summary,
+                ..
+            } => {
+                let _ = writeln!(err, "smith: {name}: {summary} ({duration_ms} ms)");
+            }
             UiEventKind::TurnStarted { .. } | UiEventKind::Usage { .. } => {}
         }
     }
@@ -450,6 +582,9 @@ async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let interactive = std::io::stdin().is_terminal();
+    if interactive && std::io::stdout().is_terminal() {
+        eprintln!("smith: esc pauses after the current step; esc esc terminates");
+    }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut subscription = session.subscribe();
 
@@ -490,6 +625,8 @@ async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
 
+        // The watcher owns stdin only while the turn runs. Drop it before the next line read.
+        let watch = watch::KeyWatch::start(session);
         // A failed or cancelled turn never entered the transcript, so there is nothing to
         // undo here. The session enforces that rule, not the REPL.
         let _ = render_turn(
@@ -501,6 +638,7 @@ async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
             &mut std::io::stderr(),
         )
         .await;
+        drop(watch);
     }
 }
 
@@ -550,17 +688,74 @@ mod tests {
     use smith_core::message::Usage;
     use smith_core::mock::MockProvider;
     use smith_core::provider::ProviderEvent;
+    use smith_core::{Tool, ToolContext, ToolError, ToolSpec};
+    use tokio::sync::Semaphore;
 
     fn session_running(provider: Arc<MockProvider>) -> SessionHandle {
         SessionManager::new(SessionConfig {
             provider,
             model: "mock-1".to_string(),
             system: None,
-            tools: Vec::new(),
+            tools: Vec::new().into(),
+            workspace: std::env::temp_dir(),
             max_tokens: None,
             temperature: None,
         })
         .create()
+    }
+
+    fn session_with_tools(provider: Arc<MockProvider>, tools: Vec<Arc<dyn Tool>>) -> SessionHandle {
+        SessionManager::new(SessionConfig {
+            provider,
+            model: "mock-1".to_string(),
+            system: None,
+            tools: tools.into(),
+            workspace: std::env::temp_dir(),
+            max_tokens: None,
+            temperature: None,
+        })
+        .create()
+    }
+
+    /// A tool that blocks until the test releases it, so the pause lands mid-batch.
+    struct BlockingTool {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl BlockingTool {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+            }
+        }
+    }
+
+    impl Tool for BlockingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "blocking".to_string(),
+                description: "a tool that blocks until released".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> futures_util::future::BoxFuture<'a, Result<String, ToolError>> {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.map_err(|_| {
+                    ToolError::Message("the test tool lost its release channel".to_string())
+                })?;
+                Ok("{\"content\":\"blocked\"}".to_string())
+            })
+        }
     }
 
     /// Render one turn and return the exit code and the output written to each stream.
@@ -812,15 +1007,64 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
             },
         ]);
+        // The loop answers the malformed call with an error result and asks again.
+        provider.push_text("recovered");
         let session = session_running(provider.clone());
         let mut subscription = session.subscribe();
 
         let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
         assert_eq!(code, EXIT_OK);
-        assert_eq!(out, "");
+        assert_eq!(out, "recovered\n");
         assert!(
             err.contains("unparseable arguments for read_file"),
             "the loop reports what the model got wrong: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_paused_turn_prints_the_pause_lines_and_exits_zero() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("blocking".to_string()),
+                args_delta: "{}".to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("unused");
+        let tool = Arc::new(BlockingTool::new());
+        let session = session_with_tools(provider, vec![tool.clone() as Arc<dyn Tool>]);
+        let mut subscription = session.subscribe();
+
+        let since = session.snapshot().await.unwrap().seq;
+        session.send("go").await.unwrap();
+
+        let background = tool.clone();
+        let handle = session.clone();
+        tokio::spawn(async move {
+            background.started.acquire().await.unwrap().forget();
+            handle.pause().await.unwrap();
+            background.release.add_permits(1);
+        });
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = render_turn(&mut subscription, "go", since, false, &mut out, &mut err).await;
+
+        assert_eq!(code, EXIT_OK);
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("smith: pausing... (esc again to terminate)"),
+            "{err}"
+        );
+        assert!(
+            err.contains("smith: paused after the current step"),
+            "{err}"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "");
     }
 }
