@@ -267,13 +267,15 @@ pub async fn run_agent(
     let mut tool_arg_errors = Vec::new();
 
     let mut system = request.system.clone().unwrap_or_default();
+    let mut sections: Vec<String> = Vec::new();
     for tool in tools {
         match tool.prepare().await {
             Ok(Some(sentence)) => {
-                if !system.is_empty() {
-                    system.push('\n');
+                // The sandbox tools share one handle and therefore return the same inventory
+                // sentence. Append each distinct fragment once, as its own section.
+                if !sections.iter().any(|existing| existing == &sentence) {
+                    sections.push(sentence);
                 }
-                system.push_str(&sentence);
             }
             Ok(None) => {}
             Err(ToolError::Message(message)) => return Err(AgentError::Failed(message)),
@@ -281,6 +283,12 @@ pub async fn run_agent(
                 return Err(AgentError::Failed("the sandbox is unavailable".to_string()))
             }
         }
+    }
+    for section in sections {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&section);
     }
     request.system = if system.is_empty() {
         None

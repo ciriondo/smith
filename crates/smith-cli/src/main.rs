@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// System prompt.
+    /// System prompt, replacing the built-in one.
     #[arg(long, value_name = "PROMPT")]
     system: Option<String>,
 

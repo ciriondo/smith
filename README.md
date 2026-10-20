@@ -189,6 +189,8 @@ its key, and its advertised models (`*` marks the default).
 
 ### Setting a system prompt
 
+smith has a built-in system prompt. `--system` replaces it for the run.
+
 ```sh
 smith --system "Answer only in JSON." -p "List three colours."
 ```
@@ -298,7 +300,7 @@ Every top-level key is optional:
 |---|---|
 | `default_provider` | Provider used when a model is addressed without a `provider/` prefix |
 | `model` | `provider/model`, or a bare id resolved against `default_provider` |
-| `system_prompt` | System message for every session |
+| `system_prompt` | Replaces the built-in system prompt for every session |
 | `max_tokens`, `temperature` | Passed through to the provider |
 | `serve.bind`, `serve.port` | What `smith serve` binds when `--bind` or `--port` are not given. `bind` must be loopback |
 | `sandbox` | Sandbox settings, described below |
@@ -421,7 +423,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 165 offline tests; no network, no API key needed
+cargo test                        # 167 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

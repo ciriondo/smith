@@ -1366,6 +1366,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_tool_prompt_fragments_are_appended_once() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_text("ok");
+        let first =
+            Arc::new(MockTool::new("first", "{}").with_prepare("The sandbox provides: bash."));
+        let second =
+            Arc::new(MockTool::new("second", "{}").with_prepare("The sandbox provides: bash."));
+        let manager = manager_with_tools(provider.clone(), vec![first, second]);
+        let session = manager.create();
+        let mut sub = session.subscribe();
+
+        session.send("go").await.unwrap();
+        let terminal = until_terminal(&mut sub).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+
+        let requests = provider.requests();
+        let system = requests[0].system.as_deref().expect("a system message");
+        assert_eq!(
+            system.matches("The sandbox provides: bash.").count(),
+            1,
+            "the shared inventory fragment appears once: {system}"
+        );
+        assert!(
+            system.starts_with("be brief\n\nThe sandbox provides"),
+            "the fragment is its own section: {system}"
+        );
+    }
+
+    #[tokio::test]
     async fn pause_when_idle_does_not_disturb_the_next_turn() {
         let provider = Arc::new(MockProvider::new("mock"));
         provider.push_text("ok");
