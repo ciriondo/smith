@@ -1,6 +1,7 @@
 use serde_json::json;
 use smith_channel::{
-    EditFileArgs, ReadFileArgs, ReadFileResult, RunShellArgs, RunShellResult, WriteFileArgs,
+    EditFileArgs, ReadFileArgs, ReadFileResult, RunShellArgs, RunShellResult, ToolWaitArgs,
+    ToolWaitResult, WriteFileArgs,
 };
 
 #[test]
@@ -65,6 +66,7 @@ fn run_shell_defaults_to_the_workspace_root_and_no_timeout() {
     assert_eq!(args.command, "cargo test");
     assert_eq!(args.cwd, None);
     assert_eq!(args.timeout_secs, None);
+    assert!(!args.background);
 }
 
 #[test]
@@ -77,6 +79,47 @@ fn run_shell_accepts_a_cwd_and_a_timeout() {
     .unwrap();
     assert_eq!(args.cwd.as_deref(), Some("crates/smith-core"));
     assert_eq!(args.timeout_secs, Some(300));
+    assert!(!args.background);
+}
+
+#[test]
+fn run_shell_accepts_background_execution() {
+    let args: RunShellArgs = serde_json::from_value(json!({
+        "command": "sleep 30",
+        "background": true
+    }))
+    .unwrap();
+    assert!(args.background);
+}
+
+#[test]
+fn tool_wait_arguments_default_to_no_kill() {
+    let args: ToolWaitArgs = serde_json::from_value(json!({"id": "t1"})).unwrap();
+    assert_eq!(args.id, "t1");
+    assert_eq!(args.timeout_secs, None);
+    assert!(!args.kill);
+}
+
+#[test]
+fn tool_wait_results_round_trip() {
+    let result = ToolWaitResult {
+        id: "t1".to_string(),
+        running: false,
+        exit_code: Some(0),
+        signal: None,
+        stdout: "done\n".to_string(),
+        stderr: String::new(),
+        truncated: false,
+        has_more: false,
+        timed_out: false,
+        killed: false,
+    };
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["id"], "t1");
+    assert_eq!(
+        serde_json::from_value::<ToolWaitResult>(value).unwrap(),
+        result
+    );
 }
 
 #[test]
@@ -103,9 +146,15 @@ fn results_round_trip_through_json() {
         truncated: false,
         timed_out: true,
         cancelled: false,
+        task_id: None,
+        running: false,
     };
     let value = serde_json::to_value(&shell).unwrap();
     assert!(value["exit_code"].is_null());
+    assert!(
+        value.get("task_id").is_none(),
+        "no task id for a sync result"
+    );
     assert_eq!(
         serde_json::from_value::<RunShellResult>(value).unwrap(),
         shell

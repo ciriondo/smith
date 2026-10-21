@@ -15,6 +15,7 @@ use smith_channel::{
 
 use crate::cancel::CancelFlag;
 use crate::proxy::Proxy;
+use crate::tasks::TaskRegistry;
 use crate::tools::{self, ToolContext};
 use crate::workspace::Workspace;
 
@@ -87,6 +88,7 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
 
     let proxy = Proxy::new(writer.clone());
     proxy.start();
+    let tasks = Arc::new(TaskRegistry::new());
 
     let mut running: Option<Running> = None;
     loop {
@@ -102,6 +104,7 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
                     current.cancel.cancel();
                     let _ = current.handle.join();
                 }
+                tasks.shutdown();
                 return Ok(());
             }
             Some(Message::ToolCall(call)) => {
@@ -123,7 +126,7 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
                     )?;
                     return Err("a second tool call arrived before the first result".into());
                 }
-                running = Some(spawn_tool(call, &writer, &workspace, &env));
+                running = Some(spawn_tool(call, &writer, &workspace, &env, tasks.clone()));
             }
             Some(Message::Cancel(Cancel { call_id })) => {
                 if let Some(current) = &running {
@@ -161,6 +164,7 @@ fn spawn_tool(
     writer: &Arc<Mutex<UnixStream>>,
     workspace: &Workspace,
     env: &BTreeMap<String, String>,
+    tasks: Arc<TaskRegistry>,
 ) -> Running {
     let ToolCall {
         call_id,
@@ -179,6 +183,7 @@ fn spawn_tool(
             workspace: &workspace,
             env: &env,
             cancel: &flag,
+            tasks: &tasks,
         };
         let message = match tools::execute(&name, args, &ctx) {
             Ok(content) => ToolResult {

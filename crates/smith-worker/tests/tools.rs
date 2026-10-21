@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use smith_channel::{ReadFileResult, RunShellResult, WriteFileResult};
+use smith_channel::{ReadFileResult, RunShellResult, ToolWaitResult, WriteFileResult};
 use smith_worker::tools::{execute, ToolContext};
-use smith_worker::{CancelFlag, Workspace};
+use smith_worker::{CancelFlag, TaskRegistry, Workspace};
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -38,12 +38,22 @@ fn fixture() -> Fixture {
 
 fn with_ctx<T>(fixture: &Fixture, f: impl FnOnce(&ToolContext<'_>) -> T) -> T {
     let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
     let ctx = ToolContext {
         workspace: &fixture.workspace,
         env: &fixture.env,
         cancel: &cancel,
+        tasks: &tasks,
     };
     f(&ctx)
+}
+
+fn background_result(ctx: &ToolContext<'_>, args: Value) -> Result<RunShellResult, String> {
+    execute("run_shell", args, ctx).map(|json| serde_json::from_str(&json).unwrap())
+}
+
+fn wait_result(ctx: &ToolContext<'_>, args: Value) -> Result<ToolWaitResult, String> {
+    execute("tool_wait", args, ctx).map(|json| serde_json::from_str(&json).unwrap())
 }
 
 fn read_file(ctx: &ToolContext<'_>, args: Value) -> Result<Value, String> {
@@ -317,10 +327,12 @@ fn run_shell_cancels_on_request() {
         thread::sleep(Duration::from_millis(200));
         trigger.cancel();
     });
+    let tasks = TaskRegistry::new();
     let ctx = ToolContext {
         workspace: &fixture.workspace,
         env: &fixture.env,
         cancel: &cancel,
+        tasks: &tasks,
     };
     let started = Instant::now();
     let result = shell_result(&ctx, json!({"command": "sleep 30"})).unwrap();
@@ -346,4 +358,149 @@ fn invalid_arguments_are_reported() {
         execute("read_file", json!({"path": "a.txt", "mode": "x"}), ctx).unwrap_err()
     });
     assert!(err.contains("invalid arguments"), "{err}");
+}
+
+#[test]
+fn background_run_returns_a_task_id_and_waits_for_completion() {
+    let fixture = fixture();
+    let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
+    let ctx = ToolContext {
+        workspace: &fixture.workspace,
+        env: &fixture.env,
+        cancel: &cancel,
+        tasks: &tasks,
+    };
+
+    let start =
+        background_result(&ctx, json!({"command": "printf done", "background": true})).unwrap();
+    let id = start.task_id.expect("a task id");
+    assert!(start.running);
+    assert_eq!(start.exit_code, None);
+
+    let wait = wait_result(&ctx, json!({"id": id, "timeout_secs": 5})).unwrap();
+    assert_eq!(wait.id, id);
+    assert!(!wait.running);
+    assert_eq!(wait.exit_code, Some(0));
+    assert_eq!(wait.stdout, "done");
+    assert!(!wait.timed_out);
+    assert!(!wait.killed);
+}
+
+#[test]
+fn tool_wait_times_out_without_stopping_the_task() {
+    let fixture = fixture();
+    let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
+    let ctx = ToolContext {
+        workspace: &fixture.workspace,
+        env: &fixture.env,
+        cancel: &cancel,
+        tasks: &tasks,
+    };
+
+    let start = background_result(
+        &ctx,
+        json!({"command": "exec sleep 30", "background": true}),
+    )
+    .unwrap();
+    let id = start.task_id.unwrap();
+
+    let wait = wait_result(&ctx, json!({"id": id, "timeout_secs": 1})).unwrap();
+    assert!(wait.running);
+    assert!(wait.timed_out);
+    assert!(!wait.killed);
+
+    let stopped = wait_result(&ctx, json!({"id": id, "timeout_secs": 5, "kill": true})).unwrap();
+    assert!(!stopped.running);
+    assert!(stopped.killed);
+    assert!(stopped.signal.is_some() || stopped.exit_code.is_some());
+}
+
+#[test]
+fn tool_wait_kill_stops_a_sleeping_task() {
+    let fixture = fixture();
+    let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
+    let ctx = ToolContext {
+        workspace: &fixture.workspace,
+        env: &fixture.env,
+        cancel: &cancel,
+        tasks: &tasks,
+    };
+
+    let start = background_result(
+        &ctx,
+        json!({"command": "exec sleep 30", "background": true}),
+    )
+    .unwrap();
+    let id = start.task_id.unwrap();
+    let wait = wait_result(&ctx, json!({"id": id, "timeout_secs": 5, "kill": true})).unwrap();
+    assert!(!wait.running);
+    assert!(wait.killed);
+    assert_eq!(wait.signal, Some(15), "SIGTERM stops sleep");
+}
+
+#[test]
+fn tool_wait_returns_output_produced_so_far() {
+    let fixture = fixture();
+    let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
+    let ctx = ToolContext {
+        workspace: &fixture.workspace,
+        env: &fixture.env,
+        cancel: &cancel,
+        tasks: &tasks,
+    };
+
+    let start = background_result(
+        &ctx,
+        json!({"command": "printf one; sleep 30", "background": true}),
+    )
+    .unwrap();
+    let id = start.task_id.unwrap();
+
+    let wait = wait_result(&ctx, json!({"id": id, "timeout_secs": 1})).unwrap();
+    assert_eq!(wait.stdout, "one");
+    assert!(wait.running);
+
+    let stopped = wait_result(&ctx, json!({"id": id, "timeout_secs": 5, "kill": true})).unwrap();
+    assert!(!stopped.running);
+    assert_eq!(stopped.stdout, "", "the first wait consumed the output");
+}
+
+#[test]
+fn an_unknown_task_is_a_tool_error() {
+    let fixture = fixture();
+    let error = with_ctx(&fixture, |ctx| {
+        wait_result(ctx, json!({"id": "t99"})).unwrap_err()
+    });
+    assert!(error.contains("unknown background run"), "{error}");
+}
+
+#[test]
+fn the_registry_refuses_more_than_its_capacity() {
+    let fixture = fixture();
+    let cancel = CancelFlag::new();
+    let tasks = TaskRegistry::new();
+    let ctx = ToolContext {
+        workspace: &fixture.workspace,
+        env: &fixture.env,
+        cancel: &cancel,
+        tasks: &tasks,
+    };
+
+    for _ in 0..16 {
+        background_result(
+            &ctx,
+            json!({"command": "exec sleep 30", "background": true}),
+        )
+        .unwrap();
+    }
+    let error = background_result(
+        &ctx,
+        json!({"command": "exec sleep 30", "background": true}),
+    )
+    .unwrap_err();
+    assert!(error.contains("too many background runs"), "{error}");
 }

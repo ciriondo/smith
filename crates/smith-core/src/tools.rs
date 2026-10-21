@@ -12,8 +12,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider::ToolSpec;
 
-/// The four tool names this milestone implements.
-pub const TOOL_NAMES: [&str; 4] = ["read_file", "write_file", "edit_file", "run_shell"];
+/// The five tool names this milestone implements.
+pub const TOOL_NAMES: [&str; 5] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_shell",
+    "tool_wait",
+];
 
 /// Why a tool call did not produce a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +75,7 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// The specs of all four tools, in a stable order.
+/// The specs of all five tools, in a stable order.
 pub fn specs() -> Vec<ToolSpec> {
     TOOL_NAMES.iter().filter_map(|name| spec(name)).collect()
 }
@@ -123,7 +129,9 @@ pub fn spec(name: &str) -> Option<ToolSpec> {
         "run_shell" => (
             "Run a command with sh -c inside the sandbox. Working directory defaults to the \
              workspace root. Output is captured per stream and capped at 32 KiB each. The \
-             default timeout is 120 seconds and the maximum is 600.",
+             default timeout is 120 seconds and the maximum is 600. With `background: true` \
+             the call returns a task id immediately and the command runs without a timeout; \
+             use `tool_wait` to collect its output, check its status or stop it.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -131,7 +139,24 @@ pub fn spec(name: &str) -> Option<ToolSpec> {
                 "properties": {
                     "command": {"type": "string", "description": "Shell command line."},
                     "cwd": {"type": "string", "description": "Working directory inside the workspace."},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds."}
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds. Ignored for a background run."},
+                    "background": {"type": "boolean", "description": "Start the command as a background task and return its id. Default false."}
+                }
+            }),
+        ),
+        "tool_wait" => (
+            "Wait on a background shell run started by `run_shell` with `background: true`. \
+             Returns the output produced since the previous wait for that run, plus its status. \
+             `timeout_secs` defaults to 120 and is capped at 600; the run keeps going when the \
+             wait times out. `kill` stops the run with SIGTERM, then SIGKILL after a grace period.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "string", "description": "Task id returned by a background run_shell call."},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Seconds to wait. Default 120."},
+                    "kill": {"type": "boolean", "description": "Stop the run and return its final output. Default false."}
                 }
             }),
         ),
@@ -153,6 +178,7 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     let target = args
         .get("path")
         .or_else(|| args.get("command"))
+        .or_else(|| args.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let first_line = target.lines().next().unwrap_or("");
@@ -171,6 +197,9 @@ pub fn summarize_result(name: &str, ok: bool, truncated: bool, content: &str) ->
     }
     if name == "run_shell" {
         if let Ok(value) = serde_json::from_str::<Value>(content) {
+            if let Some(id) = value["task_id"].as_str() {
+                return format!("started {id}");
+            }
             if value["cancelled"].as_bool() == Some(true) {
                 return "cancelled".to_string();
             }
@@ -181,6 +210,30 @@ pub fn summarize_result(name: &str, ok: bool, truncated: bool, content: &str) ->
                 let suffix = if truncated { ", output truncated" } else { "" };
                 return format!("exit {code}{suffix}");
             }
+        }
+    }
+    if name == "tool_wait" {
+        if let Ok(value) = serde_json::from_str::<Value>(content) {
+            let id = value["id"].as_str().unwrap_or("?");
+            if value["killed"].as_bool() == Some(true) {
+                return format!("{id} killed");
+            }
+            if value["running"].as_bool() == Some(true) {
+                let suffix = if value["timed_out"].as_bool() == Some(true) {
+                    "still running"
+                } else {
+                    "running"
+                };
+                return format!("{id} {suffix}");
+            }
+            if let Some(signal) = value["signal"].as_i64() {
+                return format!("{id} signal {signal}");
+            }
+            if let Some(code) = value["exit_code"].as_i64() {
+                let suffix = if truncated { ", output truncated" } else { "" };
+                return format!("{id} exit {code}{suffix}");
+            }
+            return format!("{id} finished");
         }
     }
     if truncated {
@@ -215,6 +268,11 @@ mod tests {
         }
         assert_eq!(specs().len(), TOOL_NAMES.len());
         assert!(spec("rm_rf").is_none());
+
+        let wait = spec("tool_wait").expect("tool_wait");
+        assert_eq!(wait.schema["required"], json!(["id"]));
+        let shell = spec("run_shell").expect("run_shell");
+        assert_eq!(shell.schema["properties"]["background"]["type"], "boolean");
     }
 
     #[test]
@@ -230,6 +288,10 @@ mod tests {
         assert_eq!(
             summarize_call("read_file", &Value::Null),
             "read_file (arguments did not parse)"
+        );
+        assert_eq!(
+            summarize_call("tool_wait", &json!({"id": "t1"})),
+            "tool_wait t1"
         );
     }
 
@@ -251,6 +313,52 @@ mod tests {
         assert_eq!(
             summarize_result("read_file", false, false, "boom"),
             "failed"
+        );
+    }
+
+    #[test]
+    fn background_summaries_name_the_task_and_status() {
+        let started = json!({
+            "exit_code": null, "stdout": "", "stderr": "", "truncated": false,
+            "timed_out": false, "cancelled": false, "task_id": "t1", "running": true
+        })
+        .to_string();
+        assert_eq!(
+            summarize_result("run_shell", true, false, &started),
+            "started t1"
+        );
+
+        let running = json!({
+            "id": "t1", "running": true, "exit_code": null, "signal": null,
+            "stdout": "", "stderr": "", "truncated": false, "has_more": false,
+            "timed_out": true, "killed": false
+        })
+        .to_string();
+        assert_eq!(
+            summarize_result("tool_wait", true, false, &running),
+            "t1 still running"
+        );
+
+        let exited = json!({
+            "id": "t1", "running": false, "exit_code": 0, "signal": null,
+            "stdout": "", "stderr": "", "truncated": false, "has_more": false,
+            "timed_out": false, "killed": false
+        })
+        .to_string();
+        assert_eq!(
+            summarize_result("tool_wait", true, false, &exited),
+            "t1 exit 0"
+        );
+
+        let signalled = json!({
+            "id": "t1", "running": false, "exit_code": null, "signal": 15,
+            "stdout": "", "stderr": "", "truncated": false, "has_more": false,
+            "timed_out": false, "killed": true
+        })
+        .to_string();
+        assert_eq!(
+            summarize_result("tool_wait", true, false, &signalled),
+            "t1 killed"
         );
     }
 }

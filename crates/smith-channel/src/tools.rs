@@ -68,13 +68,16 @@ pub struct EditFileResult {
 }
 
 /// Arguments of `run_shell`. `cwd` is resolved against the workspace and defaults to its
-/// root. `timeout_secs` defaults to 120 and is capped at 600.
+/// root. `timeout_secs` defaults to 120 and is capped at 600 for a synchronous call. A
+/// background call ignores it and runs until it finishes or is killed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunShellArgs {
     pub command: String,
     pub cwd: Option<String>,
     pub timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Result of `run_shell`. `exit_code` is `None` when no code was produced, for example when
@@ -89,4 +92,45 @@ pub struct RunShellResult {
     pub truncated: bool,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// Present when this result starts a background run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// True for a background start, false for a synchronous result.
+    #[serde(default)]
+    pub running: bool,
+}
+
+/// Arguments of `tool_wait`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolWaitArgs {
+    /// Task id returned by `run_shell` with `background: true`.
+    pub id: String,
+    /// Seconds to wait. Defaults to 120 and is capped at 600.
+    pub timeout_secs: Option<u32>,
+    /// Stop the task, then return its final output.
+    #[serde(default)]
+    pub kill: bool,
+}
+
+/// Result of `tool_wait`. Output fields carry only bytes produced since the previous wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolWaitResult {
+    pub id: String,
+    /// True when the task was still running when the wait returned.
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    /// Terminating signal, when the task died from one.
+    pub signal: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// True when the 1 MiB spool cap discarded output.
+    pub truncated: bool,
+    /// True when the spool holds more than this wait returned.
+    pub has_more: bool,
+    /// True when the wait timeout expired before the task finished.
+    pub timed_out: bool,
+    /// True when this wait sent a signal to the task.
+    pub killed: bool,
 }

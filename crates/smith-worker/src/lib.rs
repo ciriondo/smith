@@ -7,9 +7,11 @@
 pub mod cancel;
 pub mod protocol;
 pub mod proxy;
+pub mod tasks;
 pub mod tools;
 pub mod workspace;
 
 pub use cancel::CancelFlag;
 pub use protocol::{run, run_with_inventory};
+pub use tasks::TaskRegistry;
 pub use workspace::Workspace;

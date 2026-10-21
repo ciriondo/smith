@@ -13,5 +13,5 @@ pub use frame::{
 };
 pub use tools::{
     EditFileArgs, EditFileResult, ReadFileArgs, ReadFileResult, RunShellArgs, RunShellResult,
-    WriteFileArgs, WriteFileResult,
+    ToolWaitArgs, ToolWaitResult, WriteFileArgs, WriteFileResult,
 };

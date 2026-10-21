@@ -1,10 +1,10 @@
-//! The four [`smith_core::Tool`] values that forward calls to the sandbox.
+//! The five [`smith_core::Tool`] values that forward calls to the sandbox.
 //!
-//! One [`Handle`] is shared by the four tools of a session. It starts the container on the
+//! One [`Handle`] is shared by the five tools of a session. It starts the container on the
 //! first call, refreshes the idle clock on every call, and removes the container after
-//! `idle_timeout` without activity.
+//! `idle_timeout` without activity. A container with an open background run is not removed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,9 +26,11 @@ pub struct Handle {
     busy: AtomicBool,
     last_used: Mutex<Instant>,
     next_call: AtomicU64,
+    /// Task ids whose background run has not reported completion through `tool_wait`.
+    open_tasks: Mutex<BTreeSet<String>>,
 }
 
-/// Build the four tools. The container starts lazily, on the first call.
+/// Build the five tools. The container starts lazily, on the first call.
 pub fn sandbox_tools(supervisor: Arc<Supervisor>, config: SandboxConfig) -> Vec<Arc<dyn Tool>> {
     let handle = Arc::new(Handle {
         supervisor,
@@ -37,6 +39,7 @@ pub fn sandbox_tools(supervisor: Arc<Supervisor>, config: SandboxConfig) -> Vec<
         busy: AtomicBool::new(false),
         last_used: Mutex::new(Instant::now()),
         next_call: AtomicU64::new(1),
+        open_tasks: Mutex::new(BTreeSet::new()),
     });
     spawn_idle_monitor(&handle);
 
@@ -64,6 +67,8 @@ impl Handle {
 
         match self.supervisor.start(&self.config).await {
             Ok(sandbox) => {
+                // A new container has no tasks from the previous one.
+                self.open_tasks.lock().unwrap().clear();
                 *state = Some(sandbox.clone());
                 Ok(sandbox)
             }
@@ -101,8 +106,37 @@ impl Handle {
         let result = sandbox
             .call(call_id, name.to_string(), args, &ctx.cancel)
             .await;
+        if let Ok(content) = &result {
+            update_open_tasks(&self.open_tasks, name, content);
+        }
         self.touch();
         result
+    }
+}
+
+/// Keep the set of background runs that have not reported completion. The idle monitor must
+/// not stop a container while a run is still writing to its spool.
+fn update_open_tasks(open: &Mutex<BTreeSet<String>>, name: &str, content: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+    let Some(id) = value
+        .get("id")
+        .or_else(|| value.get("task_id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let running = value.get("running").and_then(Value::as_bool);
+    let mut open = open.lock().unwrap();
+    match name {
+        "run_shell" if running == Some(true) && value.get("task_id").is_some() => {
+            open.insert(id.to_string());
+        }
+        "tool_wait" if running == Some(false) => {
+            open.remove(id);
+        }
+        _ => {}
     }
 }
 
@@ -116,6 +150,9 @@ fn spawn_idle_monitor(handle: &Arc<Handle>) {
                 break;
             };
             if handle.busy.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !handle.open_tasks.lock().unwrap().is_empty() {
                 continue;
             }
             if handle.last_used.lock().unwrap().elapsed() < idle_timeout {
@@ -234,6 +271,38 @@ mod tests {
         assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:3128");
         assert!(env["PATH"].starts_with('/'));
         assert!(!env.contains_key("EDITOR"));
+    }
+
+    #[test]
+    fn open_tasks_follow_background_and_wait_results() {
+        let open = Mutex::new(BTreeSet::new());
+        update_open_tasks(
+            &open,
+            "run_shell",
+            &serde_json::json!({"task_id": "t1", "running": true}).to_string(),
+        );
+        assert!(open.lock().unwrap().contains("t1"));
+
+        update_open_tasks(
+            &open,
+            "tool_wait",
+            &serde_json::json!({"id": "t1", "running": true}).to_string(),
+        );
+        assert!(open.lock().unwrap().contains("t1"));
+
+        update_open_tasks(
+            &open,
+            "tool_wait",
+            &serde_json::json!({"id": "t1", "running": false}).to_string(),
+        );
+        assert!(open.lock().unwrap().is_empty());
+
+        update_open_tasks(
+            &open,
+            "run_shell",
+            &serde_json::json!({"exit_code": 0, "running": false}).to_string(),
+        );
+        assert!(open.lock().unwrap().is_empty());
     }
 
     #[test]

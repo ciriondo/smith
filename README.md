@@ -13,7 +13,7 @@ network interface, a read-only root filesystem and explicit mounts.
 
 | | |
 |---|---|
-| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file` and `run_shell` in a sandbox |
+| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file`, `run_shell` and background `tool_wait` in a sandbox |
 | **Not yet** | Session persistence across restarts; resource limits; the vendored podman fallback |
 | **Milestones** | M0/M1 (core, CLI), M2 (tools and sandbox) and M4 (web) done |
 
@@ -212,6 +212,10 @@ container cannot start, the turn fails and smith prints why.
 - A session's container stops after `[sandbox] idle_timeout` without activity, on disconnect
   and on process exit. Process state does not survive a stop; the filesystem does, through the
   workspace and the caches.
+- `run_shell` with `background: true` starts a long command and returns a task id. `tool_wait`
+  returns the output produced since the previous wait, reports whether the task is still
+  running, and can stop it. A container with an open background run is not stopped by the idle
+  timer.
 
 The allowlist is empty by default. A `cargo fetch` through the proxy needs these entries:
 
@@ -423,7 +427,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 167 offline tests; no network, no API key needed
+cargo test                        # 180 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

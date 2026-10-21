@@ -1,4 +1,4 @@
-//! The four tools, executed inside the sandbox.
+//! The five tools, executed inside the sandbox.
 //!
 //! Each function resolves its paths through [`Workspace`], applies the caps in this module and
 //! returns either the result JSON or a message for the model. Nothing here holds policy: the
@@ -21,10 +21,11 @@ use serde::Serialize;
 use serde_json::Value;
 use smith_channel::{
     EditFileArgs, EditFileResult, ReadFileArgs, ReadFileResult, RunShellArgs, RunShellResult,
-    WriteFileArgs, WriteFileResult,
+    ToolWaitArgs, WriteFileArgs, WriteFileResult,
 };
 
 use crate::cancel::CancelFlag;
+use crate::tasks::TaskRegistry;
 use crate::workspace::Workspace;
 
 /// How much of a file `read_file` scans to count lines.
@@ -39,6 +40,8 @@ const BINARY_PROBE_BYTES: usize = 8 * 1024;
 const MAX_STREAM_BYTES: usize = 32 * 1024;
 const DEFAULT_TIMEOUT_SECS: u32 = 120;
 const MAX_TIMEOUT_SECS: u32 = 600;
+const DEFAULT_WAIT_SECS: u32 = 120;
+const MAX_WAIT_SECS: u32 = 600;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -47,6 +50,7 @@ pub struct ToolContext<'a> {
     pub workspace: &'a Workspace,
     pub env: &'a BTreeMap<String, String>,
     pub cancel: &'a CancelFlag,
+    pub tasks: &'a TaskRegistry,
 }
 
 /// Run one tool by name.
@@ -56,6 +60,7 @@ pub fn execute(name: &str, args: Value, ctx: &ToolContext<'_>) -> Result<String,
         "write_file" => write_file(parse(args)?, ctx),
         "edit_file" => edit_file(parse(args)?, ctx),
         "run_shell" => run_shell(parse(args)?, ctx),
+        "tool_wait" => tool_wait(parse(args)?, ctx),
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -218,14 +223,10 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
             truncated: false,
             timed_out: false,
             cancelled: true,
+            task_id: None,
+            running: false,
         });
     }
-
-    let timeout = Duration::from_secs(
-        args.timeout_secs
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS) as u64,
-    );
 
     let mut command = Command::new("/bin/sh");
     command
@@ -237,8 +238,29 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A separate group lets a timeout or a cancel reach grandchildren.
+        // A separate group lets a timeout, a cancel or a task kill reach grandchildren.
         .process_group(0);
+
+    if args.background {
+        // A background run has no timeout. The model stops it with tool_wait and kill.
+        let task_id = ctx.tasks.start(command)?;
+        return to_json(&RunShellResult {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            cancelled: false,
+            task_id: Some(task_id),
+            running: true,
+        });
+    }
+
+    let timeout = Duration::from_secs(
+        args.timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS) as u64,
+    );
 
     let mut child = command
         .spawn()
@@ -290,7 +312,19 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
         truncated: out_truncated || err_truncated,
         timed_out,
         cancelled,
+        task_id: None,
+        running: false,
     })
+}
+
+pub fn tool_wait(args: ToolWaitArgs, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let timeout = Duration::from_secs(
+        args.timeout_secs
+            .unwrap_or(DEFAULT_WAIT_SECS)
+            .clamp(1, MAX_WAIT_SECS) as u64,
+    );
+    let result = ctx.tasks.wait(&args.id, timeout, args.kill, ctx.cancel)?;
+    to_json(&result)
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
