@@ -18,9 +18,9 @@ cargo clippy --all-targets -- -D warnings
 All build, test and lint commands go through cargo. There is no wrapper script or second build
 system. `smith` is the only binary. `cargo run -q -p smith-cli -- …` runs it during development.
 The default test suite is offline. It requires no API key and no external network access. The
-only socket it opens is bound to loopback. One test is ignored: it builds the sandbox image and
-starts a container, so it needs podman and network. Run it with
-`cargo test -p smith-sandbox -- --ignored` after `cargo build -p smith-worker`.
+only sockets it opens are bound to loopback. Three tests are ignored: they build the sandbox
+image and start containers, so they need podman and network. Run them with
+`cargo test -p smith-sandbox -- --ignored` after `cargo build --workspace`.
 
 Use rustup's cargo. The system `cargo` (version 1.75 on this machine) cannot parse the dependency
 graph and fails with `lock file version 4 requires -Znext-lockfile-bump`. That failure is a
@@ -83,7 +83,15 @@ The data flow is:
 `Command → session actor → agent turn → provider stream → UiEvent → frontend`
 
 A tool call adds a branch: `agent turn → smith_core::Tool → smith-sandbox → channel →
-smith-worker → container process`.
+smith-worker → container process`. In inherit mode, the `Tool` calls the `smith-worker` library
+directly inside the existing container; no supervisor and no new container are created.
+
+A sandboxed `smith -p` child adds a provider branch: `child adapter → 127.0.0.1:3129 → worker
+provider listener → ProviderRequest frame → host ProviderProxy → provider`. The child holds no
+provider key. The host proxy adds the parent's credential, model and session header.
+
+Subagents are `smith -p` processes started through `run_shell`; there is no subagent tool. The
+child's final answer is the `run_shell` result's `stdout`.
 
 The stable extension seams are `smith_core::Provider` (a wire-format adapter), the
 `Command`/`UiEventKind` pair (a frontend) and `smith_core::Tool` (a tool implementation).
@@ -122,9 +130,23 @@ Core boundaries:
   in-flight provider response and the whole tool batch finish first. The terminal watcher
   (`crates/smith-cli/src/watch.rs`) owns stdin in raw mode only while a turn runs and restores it
   on drop; frontends map the first Esc to `Pause` and the second to `Cancel`.
-- Declare user-facing settings in `Config` and `FileConfig`, and consume them by field. The only
-  direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`)
-  and environment-only secrets (`api_key_env`). All other settings are read from `Config`.
+- Tool execution has two compositions. A host process builds the sandbox tool factory and one
+  container per session. A process already inside a smith sandbox (`SMITH_IN_SANDBOX=1`) resolves
+  `--sandbox=auto` to inherit and uses the `smith-worker` tool functions in the current
+  environment. `--sandbox=container` refuses inside the sandbox and `--sandbox=inherit` refuses
+  outside it, so a child neither nests a container nor runs tools on the host. The inherit path
+  starts no supervisor; the outer worker still owns the container.
+- A child's provider is the `sandbox` provider from the image's `/etc/smith/config.toml`. The
+  host proxy in `smith-providers/src/proxy.rs` replaces the child's model and sends the parent's
+  headers; only the request body comes from the child. The worker inserts
+  `SMITH_SANDBOX_TOKEN` after the configured environment, so a configured value cannot replace
+  it. The image contains both `smith` and `smith-worker`, and its tag carries both digests.
+- Declare user-facing settings in `Config` and `FileConfig`, and consume them by field. The
+  direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`),
+  environment-only secrets (`api_key_env`), the binary locations (`SMITH_BIN`,
+  `SMITH_WORKER_BIN`) and the process markers (`SMITH_IN_SANDBOX`, `SMITH_SANDBOX_TOKEN`). The
+  markers are set by the sandbox and the worker, not by the user. All other settings are read
+  from `Config`.
 - The session actor owns the only mutable conversation state. Frontends hold `SessionHandle`
   clones. Do not add global mutable state. Spawned tasks must not outlive the session they
   serve.
@@ -168,9 +190,10 @@ ignored; it needs podman, a built worker and network.
 - Wire-format tests replay the recorded SSE captures in
   `crates/smith-providers/tests/fixtures/` through the same parser the live stream uses. Do not
   hand-write provider JSON. Record a new fixture when the real format changes.
-- Exercise the router through `tower::ServiceExt::oneshot` rather than a socket. Exactly one test
-  opens a real socket to prove the bound address is loopback. A second socket test would add
-  port allocation and timing without testing different code.
+- Exercise the router through `tower::ServiceExt::oneshot` rather than a socket. One web test
+  opens a real socket to prove the bound address is loopback. The worker provider listener tests
+  bind loopback on an ephemeral port because that listener parses HTTP itself. Do not add a
+  further socket test for behavior a pure function can show.
 - `Config::load` reads the process environment. Cargo runs tests in parallel threads. Any test
   that sets `SMITH_*` must take a shared lock and restore the previous value, as
   `env_overrides_model` does. Prefer passing a path or value explicitly. The suite must pass
@@ -318,7 +341,8 @@ The dependency direction is an architecture rule:
 - `smith-worker` must never gain a network client, an HTTP server, a terminal library or the
   sandbox supervisor. Check with
   `cargo tree -p smith-worker -e normal | grep -E 'reqwest|hyper|axum|clap|rustyline'`, which
-  must print nothing.
+  must print nothing. `smith-cli` links the worker library for inherit mode; the dependency is
+  one-way and the worker rule is unchanged.
 - `smith-sandbox` talks to podman through `tokio::process`, maps the channel descriptor with
   `command-fds` and leaves the descriptor arithmetic to `nix`. `smith-channel` depends only on
   `serde` and `serde_json`, so the worker links a small static binary.

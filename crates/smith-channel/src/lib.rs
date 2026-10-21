@@ -9,7 +9,8 @@ pub mod tools;
 
 pub use frame::{
     read_frame, write_frame, Cancel, ChannelError, Connect, ConnectResult, FrameKind, Hello,
-    HelloAck, Log, LogLevel, Message, ToolCall, ToolResult, MAX_PAYLOAD, PROTOCOL_VERSION,
+    HelloAck, Log, LogLevel, Message, ProviderCancel, ProviderData, ProviderEnd, ProviderFailure,
+    ProviderHead, ProviderRequest, ToolCall, ToolResult, MAX_PAYLOAD, PROTOCOL_VERSION,
 };
 pub use tools::{
     EditFileArgs, EditFileResult, ReadFileArgs, ReadFileResult, RunShellArgs, RunShellResult,

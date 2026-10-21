@@ -4,6 +4,7 @@
 //! [`UiEvent`]s it receives. It holds no conversation state. The same session layer supports
 //! the web server.
 
+mod local;
 mod watch;
 
 use std::io::{IsTerminal, Write};
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use smith_core::config::Config;
 use smith_core::session::{
@@ -24,6 +25,45 @@ use smith_core::{SmithError, UiEventKind};
 const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_CANCELLED: u8 = 130;
+
+/// How tool calls obtain their execution environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SandboxMode {
+    /// Inherit an existing smith sandbox, otherwise create a container.
+    Auto,
+    /// Always create a container. Refused inside a smith sandbox.
+    Container,
+    /// Run tools in the current environment. Refused outside a smith sandbox.
+    Inherit,
+}
+
+/// The resolved tool environment. `Auto` never reaches `build_manager`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSandbox {
+    Container,
+    Inherit,
+}
+
+fn inside_sandbox() -> bool {
+    std::env::var("SMITH_IN_SANDBOX").is_ok_and(|value| value == "1")
+}
+
+fn resolve_sandbox_mode(mode: SandboxMode, inside: bool) -> Result<ToolSandbox, SmithError> {
+    match (mode, inside) {
+        (SandboxMode::Auto, true) | (SandboxMode::Inherit, true) => Ok(ToolSandbox::Inherit),
+        (SandboxMode::Auto, false) | (SandboxMode::Container, false) => Ok(ToolSandbox::Container),
+        (SandboxMode::Container, true) => Err(SmithError::Config(
+            "refusing to create a nested sandbox: already inside a smith sandbox; \
+             use --sandbox=inherit or auto"
+                .to_string(),
+        )),
+        (SandboxMode::Inherit, false) => Err(SmithError::Config(
+            "refusing to run tools outside a sandbox: \
+             --sandbox=inherit requires SMITH_IN_SANDBOX=1"
+                .to_string(),
+        )),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "smith", version, about = "a barebones coding agent")]
@@ -47,6 +87,16 @@ struct Cli {
     /// Print reasoning tokens (providers that emit them) to stderr.
     #[arg(long)]
     show_reasoning: bool,
+
+    /// Tool sandbox: auto creates a container on the host and inherits an existing sandbox.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        value_name = "MODE",
+        global = true
+    )]
+    sandbox: SandboxMode,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -152,13 +202,19 @@ async fn run(cli: Cli) -> ExitCode {
                 cli.system.clone(),
                 args,
                 cli.show_reasoning,
+                cli.sandbox,
             )
             .await
         }
         None => {}
     }
 
-    let manager = match build_manager(&config, cli.model.as_deref(), cli.system.clone()) {
+    let manager = match build_manager(
+        &config,
+        cli.model.as_deref(),
+        cli.system.clone(),
+        cli.sandbox,
+    ) {
         Ok(manager) => manager,
         Err(e) => {
             eprintln!("smith: {e}");
@@ -189,7 +245,11 @@ fn build_manager(
     config: &Config,
     model_flag: Option<&str>,
     system_flag: Option<String>,
+    sandbox: SandboxMode,
 ) -> Result<SessionManager, SmithError> {
+    // Resolve the mode before the provider, so a guard failure does not require a key.
+    let tool_sandbox = resolve_sandbox_mode(sandbox, inside_sandbox())?;
+
     let model_spec = model_flag.unwrap_or(&config.model);
     let model = config.resolve_model(model_spec)?;
     let provider_cfg = config.provider(&model.provider)?;
@@ -198,27 +258,55 @@ fn build_manager(
     let workspace = std::env::current_dir()
         .map_err(|e| SmithError::Config(format!("cannot resolve the workspace: {e}")))?;
 
-    let supervisor =
-        Arc::new(smith_sandbox::Supervisor::new().map_err(|e| SmithError::Config(e.to_string()))?);
-    let settings = config.sandbox.clone();
-    let sandbox_workspace = workspace.clone();
-    let factory = move |id: &smith_core::SessionId| {
-        let sandbox = smith_sandbox::SandboxConfig {
-            workspace: sandbox_workspace.clone(),
-            session: id.as_str().to_string(),
-            allow: settings.allow.clone(),
-            ro_mounts: settings.ro_mounts.clone(),
-            env: smith_sandbox::standard_env(&settings),
-            idle_timeout: settings.idle_timeout,
-        };
-        smith_sandbox::sandbox_tools(supervisor.clone(), sandbox)
+    let tools = match tool_sandbox {
+        ToolSandbox::Container => {
+            let supervisor = Arc::new(
+                smith_sandbox::Supervisor::new().map_err(|e| SmithError::Config(e.to_string()))?,
+            );
+            let settings = config.sandbox.clone();
+            let sandbox_workspace = workspace.clone();
+            let provider_id = model.provider.clone();
+            let provider_cfg = provider_cfg.clone();
+            let model_id = model.model.clone();
+            let factory = move |id: &smith_core::SessionId| {
+                // The child's provider is the host proxy for this session. A failure here
+                // leaves the sandbox without a provider, which the child reports as a 502.
+                let proxy = match smith_providers::build_proxy(
+                    &provider_id,
+                    &provider_cfg,
+                    id.as_str(),
+                    &model_id,
+                ) {
+                    Ok(proxy) => Some(proxy),
+                    Err(e) => {
+                        eprintln!("smith: sandbox provider proxy: {e}");
+                        None
+                    }
+                };
+                let mut env = smith_sandbox::standard_env(&settings);
+                env.insert("SMITH_PROVIDER".to_string(), "sandbox".to_string());
+                env.insert("SMITH_MODEL".to_string(), model_id.clone());
+                let sandbox = smith_sandbox::SandboxConfig {
+                    workspace: sandbox_workspace.clone(),
+                    session: id.as_str().to_string(),
+                    allow: settings.allow.clone(),
+                    ro_mounts: settings.ro_mounts.clone(),
+                    env,
+                    idle_timeout: settings.idle_timeout,
+                    provider: proxy,
+                };
+                smith_sandbox::sandbox_tools(supervisor.clone(), sandbox)
+            };
+            ToolSet::Factory(Arc::new(factory))
+        }
+        ToolSandbox::Inherit => ToolSet::Fixed(local::local_tools(&workspace)?),
     };
 
     Ok(SessionManager::new(SessionConfig {
         provider,
         model: model.model,
         system: system_flag.or_else(|| config.system_prompt.clone()),
-        tools: ToolSet::Factory(Arc::new(factory)),
+        tools,
         workspace,
         max_tokens: config.max_tokens,
         temperature: config.temperature,
@@ -268,6 +356,7 @@ async fn serve(
     system_flag: Option<String>,
     args: ServeArgs,
     show_reasoning: bool,
+    sandbox: SandboxMode,
 ) -> ExitCode {
     // Precedence, highest first: the flag, the `[serve]` section, the built-in default.
     let bind: IpAddr = match args.bind.as_deref() {
@@ -290,7 +379,7 @@ async fn serve(
         return ExitCode::FAILURE;
     }
 
-    let manager = match build_manager(config, model_flag, system_flag) {
+    let manager = match build_manager(config, model_flag, system_flag, sandbox) {
         Ok(manager) => manager,
         Err(e) => {
             eprintln!("smith: {e}");
@@ -690,6 +779,36 @@ mod tests {
     use smith_core::provider::ProviderEvent;
     use smith_core::{Tool, ToolContext, ToolError, ToolSpec};
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn sandbox_mode_resolution_guards_nesting_and_host_tools() {
+        assert_eq!(
+            resolve_sandbox_mode(SandboxMode::Auto, true).unwrap(),
+            ToolSandbox::Inherit
+        );
+        assert_eq!(
+            resolve_sandbox_mode(SandboxMode::Auto, false).unwrap(),
+            ToolSandbox::Container
+        );
+        assert_eq!(
+            resolve_sandbox_mode(SandboxMode::Container, false).unwrap(),
+            ToolSandbox::Container
+        );
+        assert_eq!(
+            resolve_sandbox_mode(SandboxMode::Inherit, true).unwrap(),
+            ToolSandbox::Inherit
+        );
+
+        let error = resolve_sandbox_mode(SandboxMode::Container, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nested sandbox"), "{error}");
+
+        let error = resolve_sandbox_mode(SandboxMode::Inherit, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SMITH_IN_SANDBOX"), "{error}");
+    }
 
     fn session_running(provider: Arc<MockProvider>) -> SessionHandle {
         SessionManager::new(SessionConfig {

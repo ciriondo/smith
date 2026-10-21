@@ -253,6 +253,17 @@ pub fn standard_env(settings: &SandboxSettings) -> BTreeMap<String, String> {
     ] {
         env.insert(name.to_string(), "http://127.0.0.1:3128".to_string());
     }
+    // Loopback is the worker's own listeners: the egress proxy and the provider proxy. A
+    // child's provider client must reach the provider listener directly, not through the
+    // egress proxy, which would refuse a loopback target.
+    for name in ["NO_PROXY", "no_proxy"] {
+        env.insert(name.to_string(), "127.0.0.1,localhost".to_string());
+    }
+
+    // The marker tells a nested smith that it is already inside the sandbox. It is set after
+    // the inherited and configured values, so configuration cannot clear it and cause a
+    // nested container.
+    env.insert("SMITH_IN_SANDBOX".to_string(), "1".to_string());
 
     env
 }
@@ -269,7 +280,9 @@ mod tests {
         assert_eq!(env["TERM"], "dumb");
         assert_eq!(env["CARGO_HOME"], "/var/cache/smith/cargo");
         assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:3128");
+        assert_eq!(env["NO_PROXY"], "127.0.0.1,localhost");
         assert!(env["PATH"].starts_with('/'));
+        assert_eq!(env["SMITH_IN_SANDBOX"], "1");
         assert!(!env.contains_key("EDITOR"));
     }
 
@@ -313,5 +326,15 @@ mod tests {
             .insert("TERM".to_string(), "xterm".to_string());
         let env = standard_env(&settings);
         assert_eq!(env["TERM"], "xterm");
+    }
+
+    #[test]
+    fn the_sandbox_marker_cannot_be_overridden() {
+        let mut settings = SandboxSettings::default();
+        settings
+            .env_set
+            .insert("SMITH_IN_SANDBOX".to_string(), "0".to_string());
+        let env = standard_env(&settings);
+        assert_eq!(env["SMITH_IN_SANDBOX"], "1");
     }
 }

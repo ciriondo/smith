@@ -13,7 +13,7 @@ network interface, a read-only root filesystem and explicit mounts.
 
 | | |
 |---|---|
-| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file`, `run_shell` and background `tool_wait` in a sandbox |
+| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file`, `run_shell` and background `tool_wait` in a sandbox, and sandboxed `smith -p` subagents whose provider calls are proxied by the host |
 | **Not yet** | Session persistence across restarts; resource limits; the vendored podman fallback |
 | **Milestones** | M0/M1 (core, CLI), M2 (tools and sandbox) and M4 (web) done |
 
@@ -79,6 +79,26 @@ Exit codes are part of the scripting contract:
 | `0` | success |
 | `1` | provider, network or configuration failure (reason on stderr) |
 | `130` | cancelled before completion |
+
+`--sandbox` selects where tool calls run. It applies to the one-shot, interactive and `serve`
+modes:
+
+| mode | behavior |
+|---|---|
+| `auto` (default) | Creates a container on the host. Inside a smith sandbox, inherits the existing sandbox. |
+| `container` | Always creates a container. Refused inside a smith sandbox. |
+| `inherit` | Runs tools in the current environment. Refused outside a smith sandbox. |
+
+Inside a smith sandbox, the environment contains `SMITH_IN_SANDBOX=1`. `auto` therefore makes a
+one-shot child use the parent container instead of starting a nested one. `inherit` does not run
+tools on the host: the guard refuses it unless that marker is set.
+
+A one-shot run inside an existing sandbox can serve as a subagent process. The image contains
+the `smith` binary, so the child runs the same code as its parent. The provider credential stays
+on the host: the child's provider calls go to the worker's loopback listener, travel over the
+channel, and are sent by the host with the parent's key. The child receives a per-container
+token, not the key. Invoke one through `run_shell`: `smith -p "<task>"`. The child's final answer
+is the command's stdout, and its tool lines and diagnostics are on stderr.
 
 ### Interactive REPL
 
@@ -197,18 +217,28 @@ smith --system "Answer only in JSON." -p "List three colours."
 
 ## Sandbox
 
-Every tool call runs inside a podman container. There is no unsandboxed mode: when the
-container cannot start, the turn fails and smith prints why.
+Tool calls run inside a podman container. On the host, smith always creates one, and there is
+no host-tool mode. A process already inside a smith sandbox can inherit that sandbox instead of
+nesting a new container; its tools execute in the current environment. When the container cannot
+start, the turn fails and smith prints why.
 
 - The container has no network interface. Egress is a `CONNECT` request that the worker sends
   over the channel; the host checks it against the allowlist, resolves the name and dials. TLS
   is end to end, and there is no DNS inside the sandbox.
+- A child `smith` reaches its provider through the worker's second loopback listener. The worker
+  sends the request body over the channel; the host proxy adds the parent's provider key, user
+  agent, session header and model, and forwards the response. The sandbox environment contains
+  `SMITH_PROVIDER=sandbox`, `SMITH_MODEL=<parent model>`, `NO_PROXY` for loopback and a
+  per-container `SMITH_SANDBOX_TOKEN`. It does not contain the provider key. The image's
+  `/etc/smith/config.toml` defines the `sandbox` provider.
 - The root filesystem is read-only, `/tmp` is a tmpfs, the workspace is mounted at its own
   path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`.
 - The environment is computed rather than inherited. Values travel over the channel and never
   appear in the container's command line.
 - The image is built on first use from a Containerfile embedded in the `smith` binary, with a
-  digest-pinned base. The build pulls roughly 150 MB, once per private store.
+  digest-pinned base. It contains `smith`, `smith-worker` and the child provider config. The
+  image tag includes both binary digests, so a rebuilt binary produces a new image. The build
+  pulls roughly 150 MB, once per private store.
 - A session's container stops after `[sandbox] idle_timeout` without activity, on disconnect
   and on process exit. Process state does not survive a stop; the filesystem does, through the
   workspace and the caches.
@@ -216,6 +246,9 @@ container cannot start, the turn fails and smith prints why.
   returns the output produced since the previous wait, reports whether the task is still
   running, and can stop it. A container with an open background run is not stopped by the idle
   timer.
+- `--sandbox=container` refuses inside a sandbox, and `--sandbox=inherit` refuses outside one.
+  The two guards keep a child from creating a nested container and keep inherit mode off the
+  host. The marker is a policy signal, not authentication against the machine's owner.
 
 The allowlist is empty by default. A `cargo fetch` through the proxy needs these entries:
 
@@ -375,6 +408,7 @@ The messages below are the text smith prints.
 | `authentication rejected by opencode-go: FreeTierError: ...` | The request is reaching the Console endpoint with a free-tier model, or the key has no OpenCode Go entitlement. Check `base_url` and the subscription. |
 | `... upstream failure: ... Insufficient account funds` | The key is valid, but the account lacks credit for that model. |
 | `cannot find the worker binary at ...; run cargo build -p smith-worker or set SMITH_WORKER_BIN` | The sandbox needs `smith-worker` next to `smith`. `cargo build` builds both. |
+| `cannot find the smith binary at ...; run cargo build -p smith-cli or set SMITH_BIN` | The image needs `smith` to run a sandboxed child. `cargo build` builds it. |
 | `unknown field `provider`` | A config file from an older schema. The key is `[providers.<id>]`; smith rejects the file rather than migrating it. |
 | `the sandbox worker did not answer within 10s` | podman started but the channel did not complete. Check that the image starts (`podman --root ~/.local/share/smith/containers/storage run --rm smith-sandbox:<version> true`) and that the worker matches the smith version. |
 | `... Model is unavailable.` | The model id is wrong or not included in the plan. Run `smith providers list`, or check the model table in the OpenCode Go documentation. |
@@ -383,6 +417,8 @@ The messages below are the text smith prints.
 | `unknown field 'temperatur', expected one of ...` | The config file contains a typo. Unknown keys are errors. |
 | `provider 'x' is new, so it has to set base_url` | A `[providers.x]` entry for a provider smith does not know must be complete because there is nothing to inherit from. |
 | `... sent a malformed response: ...` | The stream contained data that could not be parsed. This is usually a proxy or a changed upstream format. The message includes the offending payload. |
+| `smith: configuration error: refusing to create a nested sandbox: already inside a smith sandbox; use --sandbox=inherit or auto` | `--sandbox=container` ran inside an existing smith sandbox. Use `inherit` or leave the mode on `auto`. |
+| `smith: configuration error: refusing to run tools outside a sandbox: --sandbox=inherit requires SMITH_IN_SANDBOX=1` | `--sandbox=inherit` ran on the host. Use `auto` or `container`, or run the process inside a smith sandbox. |
 | `smith: cancelled` | Ctrl-C, Esc Esc, or a web terminate stopped the turn. Not an error. |
 | `smith: paused after the current step` | Esc paused the turn. Send a message to continue. |
 | `401` from the web server | The bearer token is missing or wrong. Open the URL smith printed at startup. The token arrives only in that fragment. |
@@ -427,7 +463,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 180 offline tests; no network, no API key needed
+cargo test                        # 199 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -436,18 +472,21 @@ Tests replay recorded SSE streams from the live endpoint
 (`crates/smith-providers/tests/fixtures/`) rather than hand-written JSON. The fixtures cover the
 empty-`choices` usage chunk and the separate `reasoning_content` channel. A scripted
 `MockProvider` and `MockTool` (`smith-core/src/mock.rs`) exercise the session layer, the tool
-loop, CLI rendering and the web API. Exactly one test opens a real socket, which proves the
-bound address is loopback.
+loop, CLI rendering and the web API. One web test opens a real socket, which proves the bound
+address is loopback. The worker's provider-listener tests bind loopback on an ephemeral port,
+because that listener parses HTTP itself.
 
-Two tests are ignored because they build the image and start containers:
+Three tests are ignored because they build the image and start containers:
 
 ```sh
-cargo build -p smith-worker
+cargo build --workspace
 cargo test -p smith-sandbox -- --ignored
 ```
 
 The first runs `run_shell` and `write_file` against a container. The second runs `cargo fetch`
-through the proxy and checks that a host outside the allowlist is refused.
+through the proxy and checks that a host outside the allowlist is refused. The third runs
+`smith -p` inside the container with a fake host proxy: the child's answer comes back through
+the channel, and the container environment holds the proxy token but not the provider key.
 
 ### Toolchain
 

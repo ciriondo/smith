@@ -14,6 +14,7 @@ use smith_channel::{
 };
 
 use crate::cancel::CancelFlag;
+use crate::provider::{Provider, TOKEN_ENV};
 use crate::proxy::Proxy;
 use crate::tasks::TaskRegistry;
 use crate::tools::{self, ToolContext};
@@ -75,7 +76,7 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
         None => return Ok(()),
     };
     let workspace = Workspace::new(ack.workspace)?;
-    let env = ack.env;
+    let mut env = ack.env;
     if let Err(e) = prepare_home(&env) {
         send(
             &writer,
@@ -88,6 +89,13 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
 
     let proxy = Proxy::new(writer.clone());
     proxy.start();
+
+    // The token is inserted after the host's environment, so configured values cannot
+    // replace it. A child reads it as its provider key.
+    let provider = Provider::new(writer.clone())?;
+    env.insert(TOKEN_ENV.to_string(), provider.token().to_string());
+    provider.start();
+
     let tasks = Arc::new(TaskRegistry::new());
 
     let mut running: Option<Running> = None;
@@ -143,6 +151,18 @@ fn serve(mut reader: UnixStream, writer: UnixStream, inventory_path: &Path) -> R
             }
             Some(Message::Eof { tunnel }) => {
                 proxy.eof(tunnel);
+            }
+            Some(Message::ProviderHead(head)) => {
+                provider.head(head.id, head.status, head.content_type);
+            }
+            Some(Message::ProviderData(data)) => {
+                provider.data(data.id, data.bytes);
+            }
+            Some(Message::ProviderEnd(end)) => {
+                provider.end(end.id);
+            }
+            Some(Message::ProviderFailure(failure)) => {
+                provider.failure(failure.id, failure.message);
             }
             Some(other) => {
                 let kind = other.kind();

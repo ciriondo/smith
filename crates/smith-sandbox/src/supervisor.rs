@@ -17,11 +17,13 @@ use std::time::Duration;
 use command_fds::{CommandFdExt, FdMapping};
 use smith_channel::{
     read_frame, write_frame, Connect, ConnectResult, Hello, HelloAck, Log, LogLevel, Message,
-    ToolCall, ToolResult, PROTOCOL_VERSION,
+    ProviderData, ProviderEnd, ProviderFailure, ProviderHead, ProviderRequest, ToolCall,
+    ToolResult, PROTOCOL_VERSION,
 };
 use smith_core::config::NetworkEntry;
-use smith_core::ToolError;
+use smith_core::{ProviderProxy, ProxyEvent, ToolError};
 use tokio::process::Command;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +38,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>;
 type Tunnels = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+type Proxies = Arc<Mutex<HashMap<u64, CancellationToken>>>;
 
 /// Everything one session needs from the supervisor.
 pub struct SandboxConfig {
@@ -45,6 +48,9 @@ pub struct SandboxConfig {
     pub ro_mounts: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub idle_timeout: Duration,
+    /// The host endpoint for a sandboxed child's provider calls, with the parent's
+    /// credential. `None` makes those calls fail.
+    pub provider: Option<Arc<dyn ProviderProxy>>,
 }
 
 /// Owns the store, the image and the caches.
@@ -88,8 +94,9 @@ impl Supervisor {
     /// Start one container for `config` and complete the handshake.
     pub async fn start(&self, config: &SandboxConfig) -> Result<Arc<Sandbox>, SandboxError> {
         let worker = worker_binary()?;
-        let tag = image::tag_for(&image::digest(&worker)?);
-        image::ensure(self, &worker, &tag).await?;
+        let smith = smith_binary()?;
+        let tag = image::tag_for(&image::digest(&worker)?, &image::digest(&smith)?);
+        image::ensure(self, &worker, &smith, &tag).await?;
 
         let (host, worker) = UnixStream::pair()?;
         host.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -191,16 +198,32 @@ impl Supervisor {
         let writer_for_reader = writer.clone();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let tunnels: Tunnels = Arc::new(Mutex::new(HashMap::new()));
+        let proxies: Proxies = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let allow = Arc::new(config.allow.clone());
+        let provider = config.provider.clone();
+        let runtime = Handle::current();
 
         let write_half = host.try_clone()?;
         thread::spawn(move || write_loop(write_half, writer_rx));
         thread::spawn({
             let pending = pending.clone();
             let tunnels = tunnels.clone();
+            let proxies = proxies.clone();
             let closed = closed.clone();
-            move || read_loop(host, writer_for_reader, pending, tunnels, closed, allow)
+            move || {
+                read_loop(ReadLoop {
+                    reader: host,
+                    out: writer_for_reader,
+                    pending,
+                    tunnels,
+                    proxies,
+                    closed,
+                    allow,
+                    provider,
+                    runtime,
+                })
+            }
         });
 
         Ok(Arc::new(Sandbox {
@@ -361,14 +384,31 @@ fn write_loop(mut writer: UnixStream, mut rx: mpsc::Receiver<Message>) {
     }
 }
 
-fn read_loop(
-    mut reader: UnixStream,
+/// The state the channel reader shares with the supervisor and the proxy tasks.
+struct ReadLoop {
+    reader: UnixStream,
     out: mpsc::Sender<Message>,
     pending: Pending,
     tunnels: Tunnels,
+    proxies: Proxies,
     closed: Arc<AtomicBool>,
     allow: Arc<Vec<NetworkEntry>>,
-) {
+    provider: Option<Arc<dyn ProviderProxy>>,
+    runtime: Handle,
+}
+
+fn read_loop(state: ReadLoop) {
+    let ReadLoop {
+        mut reader,
+        out,
+        pending,
+        tunnels,
+        proxies,
+        closed,
+        allow,
+        provider,
+        runtime,
+    } = state;
     loop {
         match read_frame(&mut reader) {
             Ok(Some(Message::ToolResult(ToolResult {
@@ -395,6 +435,27 @@ fn read_loop(
             Ok(Some(Message::Eof { tunnel })) => {
                 tunnels.lock().unwrap().remove(&tunnel);
             }
+            Ok(Some(Message::ProviderRequest(ProviderRequest { id, body }))) => match &provider {
+                Some(proxy) => {
+                    let cancel = CancellationToken::new();
+                    proxies.lock().unwrap().insert(id, cancel.clone());
+                    let proxy = proxy.clone();
+                    let out = out.clone();
+                    let proxies = proxies.clone();
+                    runtime.spawn(forward(proxy, id, body, cancel, proxies, out));
+                }
+                None => {
+                    let _ = out.blocking_send(Message::ProviderFailure(ProviderFailure {
+                        id,
+                        message: "the sandbox has no provider proxy".to_string(),
+                    }));
+                }
+            },
+            Ok(Some(Message::ProviderCancel(cancel))) => {
+                if let Some(token) = proxies.lock().unwrap().remove(&cancel.id) {
+                    token.cancel();
+                }
+            }
             Ok(Some(Message::Log(Log { level, message }))) => {
                 let level = match level {
                     LogLevel::Debug => "debug",
@@ -414,6 +475,64 @@ fn read_loop(
     // maps to `SandboxGone`.
     pending.lock().unwrap().clear();
     tunnels.lock().unwrap().clear();
+    for (_, cancel) in proxies.lock().unwrap().drain() {
+        cancel.cancel();
+    }
+}
+
+/// Forward one child request and write its response as frames. The proxy sends `Head`, any
+/// number of `Data` and `End`; an error is reported as `ProviderFailure`, which lets the
+/// worker close a response that already started.
+async fn forward(
+    proxy: Arc<dyn ProviderProxy>,
+    id: u64,
+    body: Vec<u8>,
+    cancel: CancellationToken,
+    proxies: Proxies,
+    out: mpsc::Sender<Message>,
+) {
+    let (events, mut receiver) = mpsc::channel::<ProxyEvent>(64);
+    let mut result = proxy.forward(body, cancel.clone(), events);
+    // The proxy owns the sender. Its result can be ready while events it already sent are
+    // still queued, so the loop keeps reading until both the result and the queue are done.
+    let mut finished = false;
+    let mut closed = false;
+    loop {
+        if finished && closed {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            event = receiver.recv(), if !closed => match event {
+                Some(ProxyEvent::Head { status, content_type }) => {
+                    let head = Message::ProviderHead(ProviderHead { id, status, content_type });
+                    if out.send(head).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ProxyEvent::Data(bytes)) => {
+                    if out.send(Message::ProviderData(ProviderData { id, bytes })).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ProxyEvent::End) => {
+                    let _ = out.send(Message::ProviderEnd(ProviderEnd { id })).await;
+                    break;
+                }
+                None => closed = true,
+            },
+            completion = &mut result, if !finished => {
+                finished = true;
+                if let Err(e) = completion {
+                    let failure = ProviderFailure { id, message: e.to_string() };
+                    let _ = out.send(Message::ProviderFailure(failure)).await;
+                    break;
+                }
+            }
+        }
+    }
+    proxies.lock().unwrap().remove(&id);
 }
 
 fn dial(
@@ -540,6 +659,33 @@ fn runtime_home() -> PathBuf {
     PathBuf::from(format!("/tmp/smith-runroot/{uid}"))
 }
 
+pub(crate) fn smith_binary() -> Result<PathBuf, SandboxError> {
+    if let Some(path) = std::env::var_os("SMITH_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(SandboxError::Config(format!(
+            "SMITH_BIN is set to {}, which is not a file",
+            path.display()
+        )));
+    }
+
+    let executable = std::env::current_exe()?;
+    let candidate = executable
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("smith");
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(SandboxError::Config(format!(
+            "cannot find the smith binary at {}; run `cargo build -p smith-cli` or set SMITH_BIN",
+            candidate.display()
+        )))
+    }
+}
+
 pub(crate) fn worker_binary() -> Result<PathBuf, SandboxError> {
     if let Some(path) = std::env::var_os("SMITH_WORKER_BIN") {
         let path = PathBuf::from(path);
@@ -565,5 +711,113 @@ pub(crate) fn worker_binary() -> Result<PathBuf, SandboxError> {
              SMITH_WORKER_BIN",
             candidate.display()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use smith_channel::FrameKind;
+    use smith_core::ProviderError;
+
+    /// A proxy that sends everything on its first poll. The supervisor must deliver the
+    /// queued frames even though the future is ready at the same time.
+    struct Immediate;
+
+    impl ProviderProxy for Immediate {
+        fn forward(
+            &self,
+            _body: Vec<u8>,
+            _cancel: CancellationToken,
+            events: mpsc::Sender<ProxyEvent>,
+        ) -> BoxFuture<'static, Result<(), ProviderError>> {
+            Box::pin(async move {
+                events
+                    .send(ProxyEvent::Head {
+                        status: 200,
+                        content_type: Some("text/event-stream".to_string()),
+                    })
+                    .await
+                    .unwrap();
+                events
+                    .send(ProxyEvent::Data(b"data: x\n\n".to_vec()))
+                    .await
+                    .unwrap();
+                events.send(ProxyEvent::End).await.unwrap();
+                Ok(())
+            })
+        }
+    }
+
+    struct Stalls;
+
+    impl ProviderProxy for Stalls {
+        fn forward(
+            &self,
+            _body: Vec<u8>,
+            _cancel: CancellationToken,
+            _events: mpsc::Sender<ProxyEvent>,
+        ) -> BoxFuture<'static, Result<(), ProviderError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn proxies() -> Proxies {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn an_immediately_finished_proxy_delivers_every_frame_in_order() {
+        let (out, mut receiver) = mpsc::channel(8);
+        let proxies = proxies();
+        proxies.lock().unwrap().insert(3, CancellationToken::new());
+
+        forward(
+            Arc::new(Immediate),
+            3,
+            Vec::new(),
+            CancellationToken::new(),
+            proxies.clone(),
+            out,
+        )
+        .await;
+
+        let mut kinds = Vec::new();
+        while let Some(message) = receiver.recv().await {
+            kinds.push(message.kind());
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                FrameKind::ProviderHead,
+                FrameKind::ProviderData,
+                FrameKind::ProviderEnd
+            ]
+        );
+        assert!(proxies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_forward_removes_it_without_frames() {
+        let (out, mut receiver) = mpsc::channel(8);
+        let proxies = proxies();
+        let cancel = CancellationToken::new();
+        proxies.lock().unwrap().insert(4, cancel.clone());
+
+        let handle = tokio::spawn(forward(
+            Arc::new(Stalls),
+            4,
+            Vec::new(),
+            cancel.clone(),
+            proxies.clone(),
+            out,
+        ));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert!(receiver.try_recv().is_err());
+        assert!(proxies.lock().unwrap().is_empty());
     }
 }

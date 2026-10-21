@@ -4,17 +4,36 @@
 //! [`build`] and a `kind` in the user's config.
 
 pub mod openai_compat;
+pub mod proxy;
 pub mod sse;
 
 use std::sync::Arc;
 
 use smith_core::config::{ProviderConfig, ProviderKind};
-use smith_core::{Provider, ProviderError};
+use smith_core::{Provider, ProviderError, ProviderProxy};
 
 /// Construct a provider from its config entry.
 pub fn build(id: &str, cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
     match cfg.kind {
         ProviderKind::OpenAiCompat => Ok(Arc::new(openai_compat::OpenAiCompat::new(id, cfg)?)),
+    }
+}
+
+/// Construct the host proxy for a sandboxed child.
+///
+/// The proxy is bound to the parent's provider, model and session. Only an
+/// OpenAI-compatible parent is supported: another wire protocol would need a pass-through of
+/// its native body and headers.
+pub fn build_proxy(
+    id: &str,
+    cfg: &ProviderConfig,
+    session: &str,
+    model: &str,
+) -> Result<Arc<dyn ProviderProxy>, ProviderError> {
+    match cfg.kind {
+        ProviderKind::OpenAiCompat => Ok(Arc::new(proxy::OpenAiCompatProxy::new(
+            id, cfg, session, model,
+        )?)),
     }
 }
 

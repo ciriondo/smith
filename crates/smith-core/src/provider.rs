@@ -1,7 +1,9 @@
 use std::pin::Pin;
 
+use futures_util::future::BoxFuture;
 use futures_util::Stream;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ProviderError;
@@ -107,4 +109,38 @@ pub trait Provider: Send + Sync {
     /// They must honour `cancel`, terminating the stream promptly with
     /// [`ProviderError::Cancelled`] when it fires.
     fn stream(&self, req: ChatRequest, cancel: CancellationToken) -> ProviderStream;
+}
+
+/// One event of a response the host forwards to a sandboxed child.
+///
+/// This is the transport half of a provider call: status, body chunks and the end. It has no
+/// wire-format meaning, so a proxy does not parse the stream it forwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyEvent {
+    Head {
+        status: u16,
+        content_type: Option<String>,
+    },
+    Data(Vec<u8>),
+    End,
+}
+
+/// Forwards a sandboxed child's provider request over the channel to the network.
+///
+/// The host implements this with the parent's provider configuration and credential, so the
+/// child never holds a provider key. The child body is forwarded as bytes; the proxy decides
+/// which parts of it are replaced.
+pub trait ProviderProxy: Send + Sync {
+    /// Send one request body and stream the response through `events`.
+    ///
+    /// The implementation sends exactly one [`ProxyEvent::Head`] followed by any number of
+    /// [`ProxyEvent::Data`] and a final [`ProxyEvent::End`]. It returns an error instead when
+    /// nothing was sent, which the worker reports as a failed request. `cancel` aborts the
+    /// host request when the child disconnects or the session is cancelled.
+    fn forward(
+        &self,
+        body: Vec<u8>,
+        cancel: CancellationToken,
+        events: mpsc::Sender<ProxyEvent>,
+    ) -> BoxFuture<'static, Result<(), ProviderError>>;
 }

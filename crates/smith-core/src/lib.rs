@@ -16,7 +16,10 @@ pub mod tools;
 
 pub use error::{ProviderError, SmithError};
 pub use message::{ContentBlock, Message, Role, StopReason, Usage};
-pub use provider::{ChatRequest, ModelInfo, Provider, ProviderEvent, ProviderStream, ToolSpec};
+pub use provider::{
+    ChatRequest, ModelInfo, Provider, ProviderEvent, ProviderProxy, ProviderStream, ProxyEvent,
+    ToolSpec,
+};
 pub use session::{
     Command, SessionConfig, SessionHandle, SessionId, SessionManager, SessionSnapshot, ToolSet,
     UiEvent, UiEventKind,

@@ -21,6 +21,7 @@ smith-core = { path = "crates/smith-core" }
 smith-providers = { path = "crates/smith-providers" }
 smith-sandbox = { path = "crates/smith-sandbox" }
 smith-web = { path = "crates/smith-web" }
+smith-worker = { path = "crates/smith-worker" }
 
 tokio = { version = "1.36", features = [
     "rt-multi-thread",
