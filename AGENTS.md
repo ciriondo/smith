@@ -149,8 +149,8 @@ Core boundaries:
   system or user config; a project file that sets it is an error. The inventory is generated
   from the final image, not a fixed list.
 - Declare user-facing settings in `Config` and `FileConfig`, and consume them by field. The
-  direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`),
-  environment-only secrets (`api_key_env`), the binary locations (`SMITH_BIN`,
+  direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`,
+  `SMITH_THEME`), environment-only secrets (`api_key_env`), the binary locations (`SMITH_BIN`,
   `SMITH_WORKER_BIN`) and the process markers (`SMITH_IN_SANDBOX`, `SMITH_SANDBOX_TOKEN`). The
   markers are set by the sandbox and the worker, not by the user. All other settings are read
   from `Config`.
@@ -161,8 +161,17 @@ Core boundaries:
   `ReasoningDelta` is a separate channel, hidden unless `--show-reasoning`, and never added to
   the transcript.
 - The CLI's reply goes to stdout. Diagnostics (reasoning, usage, tool blocks and errors) go to
-  stderr. Exit codes `0`, `1` and `130` are a scripting contract. `render_turn` takes generic
-  writers so tests can check output and codes byte for byte. Keep that signature.
+  stderr. Exit codes `0`, `1` and `130` are a scripting contract. `render_turn` takes a `Theme`
+  and generic writers so tests can check output and codes byte for byte. Keep that signature.
+- The terminal theme follows hax: `auto`, `dark`, `light`, `ansi` or `off` from `[ui] theme`,
+  `SMITH_THEME`, `NO_COLOR`, `TERM`, `COLORTERM` and `COLORFGBG`. The roles are accent, chrome,
+  dim, heading, code, code block, link, add, remove, ok, warn and error. `smith-cli/src/theme.rs`
+  holds the palettes; the provisional values are reviewed with the web palette.
+- Assistant text is rendered through a line-oriented Markdown highlighter in the terminal
+  (`smith-cli/src/markdown.rs`) and a DOM writer in the web UI. The subset is headings, fenced
+  and inline code, links, bold, italic, list and quote markers and rules; tables, reflow and
+  nested emphasis are out. The markers are removed. The web writer never uses `innerHTML` and
+  links only `http` and `https`.
 - A finished tool emits its bounded `ToolDisplay` in `ToolFinished`: `Collapsed`, `Head`,
   `HeadTail` or `Diff`. `smith-core/src/tools.rs` computes it from the call arguments before
   the call and from the result after it; a failed call shows the error head. The CLI prints the

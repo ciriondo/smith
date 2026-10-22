@@ -5,6 +5,8 @@
 //! the web server.
 
 mod local;
+mod markdown;
+mod theme;
 mod watch;
 
 use std::io::{IsTerminal, Write};
@@ -20,6 +22,7 @@ use smith_core::session::{
     SessionConfig, SessionHandle, SessionManager, SubError, Subscription, ToolSet,
 };
 use smith_core::{SmithError, ToolDisplay, UiEventKind};
+use theme::{Role, Theme};
 
 /// Exit codes. `-p` mode is used by scripts, so these values are part of the contract.
 const EXIT_OK: u8 = 0;
@@ -226,6 +229,7 @@ async fn run(cli: Cli) -> ExitCode {
     // The session id is also the provider's conversation id.
     let session = manager.create();
     let show_reasoning = cli.show_reasoning;
+    let theme = Theme::from_setting(config.ui.theme);
 
     // One listener covers both modes: Ctrl-C cancels the running turn rather than the
     // process, and the session ignores a cancel when nothing is running.
@@ -233,10 +237,10 @@ async fn run(cli: Cli) -> ExitCode {
 
     match cli.print {
         Some(prompt) => {
-            let code = prompt_and_render(&session, prompt, show_reasoning).await;
+            let code = prompt_and_render(&session, prompt, show_reasoning, theme).await;
             ExitCode::from(code)
         }
-        None => repl(&session, show_reasoning).await,
+        None => repl(&session, show_reasoning, theme).await,
     }
 }
 
@@ -390,6 +394,7 @@ async fn serve(
     // Shared rather than moved: with `--repl`, the terminal holds a session handle from the
     // same set the browser uses.
     let manager = Arc::new(manager);
+    let theme = Theme::from_setting(config.ui.theme);
 
     let bound = match smith_web::bind(smith_web::ServerConfig {
         sessions: manager.clone(),
@@ -407,7 +412,7 @@ async fn serve(
     };
 
     if args.repl {
-        attach_repl(&manager.create(), show_reasoning);
+        attach_repl(&manager.create(), show_reasoning, theme);
     }
 
     match smith_web::serve(bound).await {
@@ -423,7 +428,7 @@ async fn serve(
 ///
 /// The session outlives the terminal: `--repl` adds a frontend to a server, so reaching
 /// end-of-input stops reading input rather than shutting the server down.
-fn attach_repl(session: &SessionHandle, show_reasoning: bool) {
+fn attach_repl(session: &SessionHandle, show_reasoning: bool, theme: Theme) {
     eprintln!(
         "smith: terminal attached to session {}. It is also in the browser's session list.",
         session.id()
@@ -432,7 +437,7 @@ fn attach_repl(session: &SessionHandle, show_reasoning: bool) {
 
     let session = session.clone();
     tokio::spawn(async move {
-        repl(&session, show_reasoning).await;
+        repl(&session, show_reasoning, theme).await;
         eprintln!("smith: terminal detached. The server is still listening.");
     });
 }
@@ -459,7 +464,12 @@ fn list_providers(config: &Config) {
 }
 
 /// Send one prompt and render the turn it starts.
-async fn prompt_and_render(session: &SessionHandle, prompt: String, show_reasoning: bool) -> u8 {
+async fn prompt_and_render(
+    session: &SessionHandle,
+    prompt: String,
+    show_reasoning: bool,
+    theme: Theme,
+) -> u8 {
     // Subscribe before snapshotting, and snapshot before sending: a subscription is a live
     // view, so one created afterwards would miss what had already been emitted, and the
     // snapshot is what marks the turn that follows as this frontend's own.
@@ -483,6 +493,7 @@ async fn prompt_and_render(session: &SessionHandle, prompt: String, show_reasoni
         &prompt,
         since,
         show_reasoning,
+        theme,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
@@ -503,11 +514,12 @@ async fn render_turn<W: Write, E: Write>(
     prompt: &str,
     since: u64,
     show_reasoning: bool,
+    theme: Theme,
     out: &mut W,
     err: &mut E,
 ) -> u8 {
-    let mut streamed_any = false;
     let mut reasoning_shown = false;
+    let mut markdown = markdown::Highlighter::new();
 
     loop {
         let event = match subscription.recv().await {
@@ -515,14 +527,21 @@ async fn render_turn<W: Write, E: Write>(
             // The transcript arrives complete with `TurnFinished`, so a lag costs display, not
             // correctness. Report the gap rather than printing silently.
             Err(SubError::Lagged(n)) => {
-                let _ = writeln!(
+                write_styled(
                     err,
-                    "smith: fell {n} events behind. Some output was skipped."
+                    theme,
+                    Role::Warn,
+                    &format!("smith: fell {n} events behind. Some output was skipped."),
                 );
                 continue;
             }
             Err(SubError::Closed) => {
-                let _ = writeln!(err, "smith: the session stopped unexpectedly");
+                write_styled(
+                    err,
+                    theme,
+                    Role::Error,
+                    "smith: the session stopped unexpectedly",
+                );
                 return EXIT_FAILED;
             }
         };
@@ -533,13 +552,11 @@ async fn render_turn<W: Write, E: Write>(
 
         match event.kind {
             UiEventKind::TextDelta { text } => {
-                let _ = write!(out, "{text}");
-                let _ = out.flush();
-                streamed_any = true;
+                markdown.feed(&text, theme, out);
             }
             UiEventKind::ReasoningDelta { text } if show_reasoning => {
                 if !reasoning_shown {
-                    let _ = write!(err, "\x1b[2m");
+                    let _ = write!(err, "{}", theme.open(Role::Dim));
                     reasoning_shown = true;
                 }
                 let _ = write!(err, "{text}");
@@ -551,163 +568,258 @@ async fn render_turn<W: Write, E: Write>(
                 tool_arg_errors,
                 ..
             } => {
-                if reasoning_shown {
-                    let _ = write!(err, "\x1b[0m");
-                }
-                if streamed_any {
-                    let _ = writeln!(out);
-                }
+                markdown.finish(theme, out);
+                finish_reasoning(err, theme, &mut reasoning_shown);
                 for failure in &tool_arg_errors {
-                    let _ = writeln!(
+                    write_styled(
                         err,
-                        "smith: model sent unparseable arguments for {}: {}",
-                        failure.tool, failure.message
+                        theme,
+                        Role::Error,
+                        &format!(
+                            "smith: model sent unparseable arguments for {}: {}",
+                            failure.tool, failure.message
+                        ),
                     );
                 }
                 if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                    let _ = writeln!(
+                    write_styled(
                         err,
-                        "smith: {} in / {} out tokens",
-                        usage.input_tokens, usage.output_tokens
+                        theme,
+                        Role::Dim,
+                        &format!(
+                            "smith: {} in / {} out tokens",
+                            usage.input_tokens, usage.output_tokens
+                        ),
                     );
                 }
-                let _ = out.flush();
-                let _ = err.flush();
+                flush(out, err);
                 return EXIT_OK;
             }
             UiEventKind::TurnPaused {
                 usage,
                 tool_arg_errors,
             } => {
-                if reasoning_shown {
-                    let _ = write!(err, "\x1b[0m");
-                }
-                if streamed_any {
-                    let _ = writeln!(out);
-                }
+                markdown.finish(theme, out);
+                finish_reasoning(err, theme, &mut reasoning_shown);
                 for failure in &tool_arg_errors {
-                    let _ = writeln!(
+                    write_styled(
                         err,
-                        "smith: model sent unparseable arguments for {}: {}",
-                        failure.tool, failure.message
+                        theme,
+                        Role::Error,
+                        &format!(
+                            "smith: model sent unparseable arguments for {}: {}",
+                            failure.tool, failure.message
+                        ),
                     );
                 }
                 if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                    let _ = writeln!(
+                    write_styled(
                         err,
-                        "smith: {} in / {} out tokens",
-                        usage.input_tokens, usage.output_tokens
+                        theme,
+                        Role::Dim,
+                        &format!(
+                            "smith: {} in / {} out tokens",
+                            usage.input_tokens, usage.output_tokens
+                        ),
                     );
                 }
-                let _ = writeln!(err, "smith: paused after the current step");
-                let _ = out.flush();
-                let _ = err.flush();
+                write_styled(
+                    err,
+                    theme,
+                    Role::Warn,
+                    "smith: paused after the current step",
+                );
+                flush(out, err);
                 return EXIT_OK;
             }
             UiEventKind::TurnFailed { message } => {
-                if reasoning_shown {
-                    let _ = write!(err, "\x1b[0m");
-                }
-                if streamed_any {
-                    let _ = writeln!(out);
-                }
-                let _ = writeln!(err, "smith: {message}");
-                let _ = out.flush();
-                let _ = err.flush();
+                markdown.finish(theme, out);
+                finish_reasoning(err, theme, &mut reasoning_shown);
+                write_styled(err, theme, Role::Error, &format!("smith: {message}"));
+                flush(out, err);
                 return EXIT_FAILED;
             }
             UiEventKind::PauseRequested => {
-                let _ = writeln!(err, "smith: pausing... (esc again to terminate)");
+                write_styled(
+                    err,
+                    theme,
+                    Role::Warn,
+                    "smith: pausing... (esc again to terminate)",
+                );
                 let _ = err.flush();
             }
             UiEventKind::Cancelled => {
-                if reasoning_shown {
-                    let _ = write!(err, "\x1b[0m");
-                }
-                if streamed_any {
-                    let _ = writeln!(out);
-                }
-                let _ = writeln!(err, "smith: cancelled");
-                let _ = out.flush();
-                let _ = err.flush();
+                markdown.finish(theme, out);
+                finish_reasoning(err, theme, &mut reasoning_shown);
+                write_styled(err, theme, Role::Warn, "smith: cancelled");
+                flush(out, err);
                 return EXIT_CANCELLED;
             }
             // This frontend's prompt was refused because another frontend started a turn
             // first. Return because this turn will not happen. Waiting would hang, since the
             // reply was never requested.
             UiEventKind::SendRejected { prompt: rejected } if rejected == prompt => {
-                let _ = writeln!(
+                write_styled(
                     err,
-                    "smith: a turn is already running. {rejected:?} was dropped."
+                    theme,
+                    Role::Error,
+                    &format!("smith: a turn is already running. {rejected:?} was dropped."),
                 );
-                let _ = out.flush();
-                let _ = err.flush();
+                flush(out, err);
                 return EXIT_FAILED;
             }
             // Another frontend's prompt was refused. Report it because the turn it belongs to
             // is unaffected.
             UiEventKind::SendRejected { prompt: rejected } => {
-                let _ = writeln!(
+                write_styled(
                     err,
-                    "smith: another frontend sent {rejected:?} while a turn was running"
+                    theme,
+                    Role::Warn,
+                    &format!("smith: another frontend sent {rejected:?} while a turn was running"),
                 );
             }
             // The call header, then its bounded output block and the outcome. The model
             // reply stays on stdout; all of this is diagnostics.
             UiEventKind::ToolStarted { summary, .. } => {
-                let _ = writeln!(err, "smith: {summary}");
+                let _ = write!(
+                    err,
+                    "{}smith:{} ",
+                    theme.open(Role::Dim),
+                    theme.close(Role::Dim)
+                );
+                let _ = write!(
+                    err,
+                    "{}{}{}",
+                    theme.open(Role::Chrome),
+                    summary,
+                    theme.close(Role::Chrome)
+                );
+                let _ = writeln!(err);
             }
             UiEventKind::ToolFinished {
+                ok,
                 duration_ms,
                 summary,
                 display,
                 ..
             } => {
-                write_display(err, &display);
-                let _ = writeln!(err, "  └ {summary} ({duration_ms} ms)");
+                write_display(err, theme, &display, ok);
+                let role = if ok { Role::Ok } else { Role::Error };
+                let _ = write!(
+                    err,
+                    "{}  └{} ",
+                    theme.open(Role::Dim),
+                    theme.close(Role::Dim)
+                );
+                let _ = write!(
+                    err,
+                    "{}{}{} ({duration_ms} ms)",
+                    theme.open(role),
+                    summary,
+                    theme.close(role)
+                );
+                let _ = writeln!(err);
             }
             UiEventKind::TurnStarted { .. } | UiEventKind::Usage { .. } => {}
         }
     }
 }
 
+fn finish_reasoning<W: Write>(err: &mut W, theme: Theme, shown: &mut bool) {
+    if *shown {
+        let _ = write!(err, "{}", theme.close(Role::Dim));
+        *shown = false;
+    }
+}
+
+fn flush<W: Write, E: Write>(out: &mut W, err: &mut E) {
+    let _ = out.flush();
+    let _ = err.flush();
+}
+
+fn write_styled<W: Write>(err: &mut W, theme: Theme, role: Role, text: &str) {
+    let _ = writeln!(err, "{}{}{}", theme.open(role), text, theme.close(role));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayKind {
+    Head,
+    HeadTail,
+    Diff,
+}
+
 /// Print a finished tool's preview rows. The first row shares the call header; the last row
 /// shares the outcome line, so the block is one visual unit.
-fn write_display<W: Write>(err: &mut W, display: &ToolDisplay) {
-    let (head, tail, omitted): (&[String], &[String], usize) = match display {
+fn write_display<W: Write>(err: &mut W, theme: Theme, display: &ToolDisplay, ok: bool) {
+    let (head, tail, omitted, kind): (&[String], &[String], usize, DisplayKind) = match display {
         ToolDisplay::Collapsed => return,
-        ToolDisplay::Head { lines, omitted } => (lines, &[], *omitted),
+        ToolDisplay::Head { lines, omitted } => (lines, &[], *omitted, DisplayKind::Head),
         ToolDisplay::HeadTail {
             head,
             tail,
             omitted,
-        } => (head, tail, *omitted),
-        ToolDisplay::Diff { lines, omitted } => (lines, &[], *omitted),
+        } => (head, tail, *omitted, DisplayKind::HeadTail),
+        ToolDisplay::Diff { lines, omitted } => (lines, &[], *omitted, DisplayKind::Diff),
     };
     for line in head {
-        let _ = writeln!(err, "  │ {line}");
+        write_display_row(err, theme, line, ok, kind);
     }
     if omitted > 0 {
-        let _ = writeln!(err, "  │ ... ({omitted} more lines) ...");
+        write_display_row(
+            err,
+            theme,
+            &format!("... ({omitted} more lines) ..."),
+            ok,
+            DisplayKind::Head,
+        );
     }
     for line in tail {
-        let _ = writeln!(err, "  │ {line}");
+        write_display_row(err, theme, line, ok, kind);
     }
 }
 
-async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
+fn write_display_row<W: Write>(err: &mut W, theme: Theme, line: &str, ok: bool, kind: DisplayKind) {
+    let role = if !ok {
+        Role::Error
+    } else {
+        match kind {
+            DisplayKind::Diff if line.starts_with('+') => Role::Add,
+            DisplayKind::Diff if line.starts_with('-') => Role::Remove,
+            DisplayKind::HeadTail if line.starts_with("! ") => Role::Warn,
+            _ => Role::Dim,
+        }
+    };
+    let _ = write!(
+        err,
+        "{}  │{} ",
+        theme.open(Role::Dim),
+        theme.close(Role::Dim)
+    );
+    let _ = write!(err, "{}{}{}", theme.open(role), line, theme.close(role));
+    let _ = writeln!(err);
+}
+
+async fn repl(session: &SessionHandle, show_reasoning: bool, theme: Theme) -> ExitCode {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let interactive = std::io::stdin().is_terminal();
     if interactive && std::io::stdout().is_terminal() {
-        eprintln!("smith: esc pauses after the current step; esc esc terminates");
+        eprintln!(
+            "{}smith: esc pauses after the current step; esc esc terminates{}",
+            theme.open(Role::Dim),
+            theme.close(Role::Dim)
+        );
     }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut subscription = session.subscribe();
 
     loop {
         if interactive {
-            print!("> ");
+            print!(
+                "{}> {}",
+                theme.open(Role::Accent),
+                theme.close(Role::Accent)
+            );
             let _ = std::io::stdout().flush();
         }
 
@@ -751,6 +863,7 @@ async fn repl(session: &SessionHandle, show_reasoning: bool) -> ExitCode {
             prompt,
             since,
             show_reasoning,
+            theme,
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         )
@@ -801,6 +914,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use smith_core::config::ThemeName;
     use smith_core::message::StopReason;
     use smith_core::message::Usage;
     use smith_core::mock::{MockProvider, MockTool};
@@ -935,6 +1049,7 @@ mod tests {
             "go",
             since,
             show_reasoning,
+            Theme::off(),
             &mut out,
             &mut err,
         )
@@ -968,7 +1083,10 @@ mod tests {
         let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
         assert_eq!(code, EXIT_OK);
         assert_eq!(out, "Hello\n");
-        assert_eq!(err, "smith: 19 in / 17 out tokens\n");
+        assert_eq!(
+            err,
+            "\x1b[2msmith: 19 in / 17 out tokens\x1b[0m\n".to_string()
+        );
     }
 
     #[tokio::test]
@@ -1067,7 +1185,16 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_turn(&mut terminal, "go", since, false, &mut out, &mut err).await;
+        let code = render_turn(
+            &mut terminal,
+            "go",
+            since,
+            false,
+            Theme::off(),
+            &mut out,
+            &mut err,
+        )
+        .await;
 
         assert_eq!(code, EXIT_OK);
         assert_eq!(
@@ -1109,7 +1236,15 @@ mod tests {
         let mut err = Vec::new();
         let code = tokio::time::timeout(
             Duration::from_secs(5),
-            render_turn(&mut terminal, "go", since, false, &mut out, &mut err),
+            render_turn(
+                &mut terminal,
+                "go",
+                since,
+                false,
+                Theme::off(),
+                &mut out,
+                &mut err,
+            ),
         )
         .await
         .expect("a rejected prompt must not leave the frontend waiting");
@@ -1195,10 +1330,10 @@ mod tests {
         let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
         assert_eq!(code, EXIT_OK);
         assert_eq!(out, "done\n");
-        assert!(err.contains("smith: run_shell echo hi"), "{err}");
-        assert!(err.contains("  │ one"), "{err}");
-        assert!(err.contains("  │ ! bad"), "{err}");
-        assert!(err.contains("  └ exit 0 ("), "{err}");
+        assert!(err.contains("run_shell echo hi"), "{err}");
+        assert!(err.contains("one"), "{err}");
+        assert!(err.contains("! bad"), "{err}");
+        assert!(err.contains("exit 0 ("), "{err}");
     }
 
     #[tokio::test]
@@ -1224,9 +1359,53 @@ mod tests {
 
         let (code, _, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
         assert_eq!(code, EXIT_OK);
-        assert!(err.contains("smith: edit_file src/a.rs"), "{err}");
-        assert!(err.contains("  │ -old"), "{err}");
-        assert!(err.contains("  │ +new"), "{err}");
+        assert!(err.contains("edit_file src/a.rs"), "{err}");
+        assert!(err.contains("-old"), "{err}");
+        assert!(err.contains("+new"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_ansi_theme_styles_the_tool_block() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("run_shell".to_string()),
+                args_delta: r#"{"command":"echo hi"}"#.to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let result = serde_json::json!({
+            "exit_code": 0, "stdout": "one\n", "stderr": "",
+            "truncated": false, "timed_out": false, "cancelled": false, "running": false
+        })
+        .to_string();
+        let tool = Arc::new(MockTool::new("run_shell", result));
+        let session = session_with_tools(provider, vec![tool as Arc<dyn Tool>]);
+        let mut subscription = session.subscribe();
+        let since = session.snapshot().await.unwrap().seq;
+        session.send("go").await.unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = render_turn(
+            &mut subscription,
+            "go",
+            since,
+            false,
+            Theme::from_name(ThemeName::Ansi),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_OK);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("\x1b[36mrun_shell echo hi\x1b[0m"), "{err}");
+        assert!(err.contains("\x1b[2m\x1b[36mone\x1b[0m"), "{err}");
+        assert!(err.contains("\x1b[32mexit 0"), "{err}");
     }
 
     #[tokio::test]
@@ -1255,12 +1434,12 @@ mod tests {
 
         let (code, _, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
         assert_eq!(code, EXIT_OK);
-        assert!(err.contains("smith: read_file src/a.rs"), "{err}");
+        assert!(err.contains("read_file src/a.rs"), "{err}");
         assert!(
             !err.contains("  │"),
             "a read must not print its content: {err}"
         );
-        assert!(err.contains("  └ ok ("), "{err}");
+        assert!(err.contains("ok ("), "{err}");
     }
 
     #[tokio::test]
@@ -1295,7 +1474,16 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_turn(&mut subscription, "go", since, false, &mut out, &mut err).await;
+        let code = render_turn(
+            &mut subscription,
+            "go",
+            since,
+            false,
+            Theme::off(),
+            &mut out,
+            &mut err,
+        )
+        .await;
 
         assert_eq!(code, EXIT_OK);
         let err = String::from_utf8(err).unwrap();

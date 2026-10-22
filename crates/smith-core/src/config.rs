@@ -104,6 +104,50 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "findings is a valid result.",
 );
 
+/// The terminal theme selected in the config file or by `SMITH_THEME`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeName {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    Ansi,
+    Off,
+}
+
+impl std::str::FromStr for ThemeName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            "ansi" => Ok(Self::Ansi),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown theme '{other}' (expected auto, dark, light, ansi, or off)"
+            )),
+        }
+    }
+}
+
+/// The frontend settings shared by every frontend. The web UI has its own CSS palette; the
+/// terminal reads the theme.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiSettings {
+    pub theme: ThemeName,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeName::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Provider used when a model is addressed without a `provider/` prefix.
@@ -115,6 +159,7 @@ pub struct Config {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub serve: ServeConfig,
+    pub ui: UiSettings,
     /// Merged by [`load_tiers`]; not part of the file schema this type deserialises.
     #[serde(skip)]
     pub sandbox: SandboxSettings,
@@ -177,6 +222,7 @@ impl Default for Config {
             max_tokens: None,
             temperature: None,
             serve: ServeConfig::default(),
+            ui: UiSettings::default(),
             sandbox: SandboxSettings::default(),
             providers,
         }
@@ -198,6 +244,7 @@ struct FileConfig {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     serve: Option<FileServe>,
+    ui: Option<FileUi>,
     project: Option<FileProject>,
     sandbox: Option<FileSandbox>,
     policy: Option<FilePolicy>,
@@ -258,6 +305,12 @@ struct FilePolicy {
 struct FileServe {
     bind: Option<IpAddr>,
     port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileUi {
+    theme: Option<ThemeName>,
 }
 
 /// One provider entry in a file. An entry for a configured provider overrides only the fields
@@ -383,6 +436,11 @@ impl Config {
             }
             if let Some(port) = serve.port {
                 self.serve.port = port;
+            }
+        }
+        if let Some(ui) = file.ui {
+            if let Some(theme) = ui.theme {
+                self.ui.theme = theme;
             }
         }
 
@@ -629,6 +687,13 @@ pub fn load_tiers(tiers: &[(Tier, PathBuf)]) -> Result<Config, SmithError> {
     if let Ok(provider) = std::env::var("SMITH_PROVIDER") {
         if !provider.is_empty() {
             config.default_provider = provider;
+        }
+    }
+    if let Ok(theme) = std::env::var("SMITH_THEME") {
+        if !theme.is_empty() {
+            config.ui.theme = theme
+                .parse::<ThemeName>()
+                .map_err(|e| SmithError::Config(format!("SMITH_THEME: {e}")))?;
         }
     }
 
@@ -924,6 +989,38 @@ mod tests {
             "Go is not the zen/Console endpoint"
         );
         assert_eq!(p.api_key_env, "OPENCODE_API_KEY");
+    }
+
+    #[test]
+    fn the_ui_theme_defaults_to_auto_and_reads_the_file() {
+        let cfg = load_named("ui-theme", &[(Tier::User, "[ui]\ntheme = \"dark\"\n")]).unwrap();
+        assert_eq!(cfg.ui.theme, ThemeName::Dark);
+
+        let cfg = load_named("ui-theme-default", &[]).unwrap();
+        assert_eq!(cfg.ui.theme, ThemeName::Auto);
+    }
+
+    #[test]
+    fn an_unknown_theme_is_rejected() {
+        let error = load_named(
+            "ui-theme-invalid",
+            &[(Tier::User, "[ui]\ntheme = \"purple\"\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("purple"), "{error}");
+    }
+
+    #[test]
+    fn smith_theme_overrides_the_file() {
+        let _guard = lock_env();
+        let prev = std::env::var("SMITH_THEME").ok();
+        std::env::set_var("SMITH_THEME", "ansi");
+        let cfg = Config::load(None).unwrap();
+        assert_eq!(cfg.ui.theme, ThemeName::Ansi);
+        match prev {
+            Some(value) => std::env::set_var("SMITH_THEME", value),
+            None => std::env::remove_var("SMITH_THEME"),
+        }
     }
 
     #[test]

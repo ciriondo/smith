@@ -116,6 +116,10 @@ message steers the model from that point. Esc again terminates the turn immediat
 terminates. Termination drops the turn from the transcript, so the model does not see a partial
 answer; a paused turn keeps the steps that completed. The startup line names both shortcuts.
 
+The reply is rendered as a Markdown subset in the terminal and the web UI: headings, fenced
+and inline code, links, bold, italic, list bullets, quotes and rules. The markers are removed.
+The terminal applies a theme; the web UI applies its own palette.
+
 Three kinds of output go to stderr, so stdout contains only the reply:
 - `--show-reasoning` prints reasoning tokens, dimmed, for models that emit them.
 - A token-usage line after each turn, for example `smith: 19 in / 17 out tokens`.
@@ -311,6 +315,7 @@ file, which outranks the project file. Each layer changes only the fields it sta
 | `OPENCODE_API_KEY` | This variable is required. It holds the credential. The variable name is configurable per provider (`api_key_env`). The value is read only from the environment. |
 | `SMITH_MODEL` | Overrides the default model, for example `opencode-go/glm-5.3`. |
 | `SMITH_PROVIDER` | Overrides the default provider. |
+| `SMITH_THEME` | Overrides the terminal theme: `auto`, `dark`, `light`, `ansi` or `off`. |
 
 ### Config file
 
@@ -353,7 +358,7 @@ smith rejects unknown fields, so a typo is an error rather than a setting that d
 
 ```
 unknown field `temperatur`, expected one of `default_provider`, `model`, `system_prompt`,
-`max_tokens`, `temperature`, `serve`, `project`, `sandbox`, `policy`, `providers`
+`max_tokens`, `temperature`, `serve`, `ui`, `project`, `sandbox`, `policy`, `providers`
 ```
 
 Every top-level key is optional:
@@ -365,6 +370,7 @@ Every top-level key is optional:
 | `system_prompt` | Replaces the built-in system prompt for every session |
 | `max_tokens`, `temperature` | Passed through to the provider |
 | `serve.bind`, `serve.port` | What `smith serve` binds when `--bind` or `--port` are not given. `bind` must be loopback |
+| `ui.theme` | Terminal theme: `auto`, `dark`, `light`, `ansi` or `off`. Default `auto` |
 | `sandbox` | Sandbox settings, described below |
 | `policy.managed` | When true, a project file that sets a sandbox list is an error |
 | `project.path` | The canonical workspace root a project file belongs to |
@@ -406,7 +412,25 @@ managed = true
 `allow` and `inherit` intersect across the tiers that set them, so a project file can narrow a
 list and never widen it. `mounts`, `image` and `policy` belong to the system or user file; a
 project file that sets any of them is an error. Package lists from the system and user tiers
-are unioned, sorted and deduplicated. The credential deny list (`SSH_AUTH_SOCK`, `PODMAN_*`, `AWS_*`,
+are unioned, sorted and deduplicated.
+
+### Terminal and web highlighting
+
+The terminal theme is `auto` by default. It follows the terminal environment:
+
+- `NO_COLOR` non-empty, or `TERM` unset, empty or `dumb`, selects `off`.
+- No `256color` in `TERM` and no `COLORTERM` selects `ansi`.
+- `COLORFGBG` with a background of `7` or `15` selects `light`; otherwise `dark`.
+
+`dark` and `light` use indexed 256 colours, `ansi` uses the 16 basic colours, and `off` uses no
+colour but keeps bold headings, dim code blocks and underlined links. `[ui] theme` or
+`SMITH_THEME` overrides the automatic choice.
+
+The web UI uses its own dark palette and a light palette under `prefers-color-scheme: light`.
+The roles are shared: accent for the user, chrome for tool headers, dim for gutters and notes,
+heading, code, code block, link, add, remove, ok, warn and error. The browser renders the same
+Markdown subset with DOM text nodes and classes; links are clickable only for `http` and
+`https`. The credential deny list (`SSH_AUTH_SOCK`, `PODMAN_*`, `AWS_*`,
 `*_TOKEN`, `EDITOR` and others) is enforced at load time, and a refused name is an error naming
 the reason.
 
@@ -451,6 +475,7 @@ The messages below are the text smith prints.
 | `unknown field 'temperatur', expected one of ...` | The config file contains a typo. Unknown keys are errors. |
 | `provider 'x' is new, so it has to set base_url` | A `[providers.x]` entry for a provider smith does not know must be complete because there is nothing to inherit from. |
 | `... sent a malformed response: ...` | The stream contained data that could not be parsed. This is usually a proxy or a changed upstream format. The message includes the offending payload. |
+| `configuration error: SMITH_THEME: unknown theme 'x' ...` | `SMITH_THEME` is not one of `auto`, `dark`, `light`, `ansi` or `off`. |
 | `smith: configuration error: refusing to create a nested sandbox: already inside a smith sandbox; use --sandbox=inherit or auto` | `--sandbox=container` ran inside an existing smith sandbox. Use `inherit` or leave the mode on `auto`. |
 | `smith: configuration error: refusing to run tools outside a sandbox: --sandbox=inherit requires SMITH_IN_SANDBOX=1` | `--sandbox=inherit` ran on the host. Use `auto` or `container`, or run the process inside a smith sandbox. |
 | `smith: cancelled` | Ctrl-C, Esc Esc, or a web terminate stopped the turn. Not an error. |
@@ -497,7 +522,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 216 offline tests; no network, no API key needed
+cargo test                        # 231 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

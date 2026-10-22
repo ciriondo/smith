@@ -85,6 +85,161 @@ function addNote(text) {
   item.scrollIntoView({ block: "end" });
 }
 
+function markdownElement(tag, className) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  return node;
+}
+
+function listMarker(line) {
+  let match = /^(\s*)([-*+]) +(.*)$/.exec(line);
+  if (match) return { kind: "md-bullet", text: `${match[1]}${match[2]} `, rest: match[3] };
+  match = /^(\s*)(\d+[.)]) +(.*)$/.exec(line);
+  if (match) return { kind: "md-bullet", text: `${match[1]}${match[2]} `, rest: match[3] };
+  match = /^(\s*)(>) +(.*)$/.exec(line);
+  if (match) return { kind: "md-quote", text: `${match[1]}${match[2]} `, rest: match[3] };
+  if (/^\s*([-*_])\1{2,}\s*$/.test(line)) return { kind: "md-rule", text: line, rest: "" };
+  return null;
+}
+
+class MarkdownWriter {
+  constructor(container) {
+    this.container = container;
+    this.line = "";
+    this.inFence = false;
+  }
+
+  feed(text) {
+    for (const character of text) {
+      if (character === "\n") this.commitLine();
+      else this.line += character;
+    }
+  }
+
+  flush() {
+    if (this.line.length) this.commitLine();
+  }
+
+  commitLine() {
+    const line = this.line.replace(/\r$/, "");
+    this.line = "";
+    this.renderLine(line);
+  }
+
+  renderLine(line) {
+    if (this.inFence) {
+      if (line.trimStart().startsWith("```")) {
+        this.inFence = false;
+        return;
+      }
+      const block = markdownElement("div", "md-code-block");
+      block.textContent = line;
+      this.container.appendChild(block);
+      return;
+    }
+    if (line.trimStart().startsWith("```")) {
+      this.inFence = true;
+      return;
+    }
+    const heading = /^(#{1,6}) +(.*)$/.exec(line);
+    if (heading) {
+      const node = markdownElement("div", "md-heading");
+      this.inline(heading[2].replace(/#+$/, "").trimEnd(), node);
+      this.container.appendChild(node);
+      return;
+    }
+    const marker = listMarker(line);
+    if (marker) {
+      const node = markdownElement("div", "md-line");
+      const span = markdownElement("span", marker.kind);
+      span.textContent = marker.text;
+      node.appendChild(span);
+      this.inline(marker.rest, node);
+      this.container.appendChild(node);
+      return;
+    }
+    const node = markdownElement("div", "md-line");
+    this.inline(line, node);
+    this.container.appendChild(node);
+  }
+
+  inline(text, container) {
+    let rest = text;
+    while (rest.length) {
+      let match = /^`([^`]*)`/.exec(rest);
+      if (match) {
+        const span = markdownElement("span", "md-code");
+        span.textContent = match[1];
+        container.appendChild(span);
+        rest = rest.slice(match[0].length);
+        continue;
+      }
+      match = /^\*\*([^*]+)\*\*/.exec(rest) || /^__([^_]+)__/.exec(rest);
+      if (match) {
+        const node = markdownElement("strong");
+        this.inline(match[1], node);
+        container.appendChild(node);
+        rest = rest.slice(match[0].length);
+        continue;
+      }
+      match = /^\*([^*]+)\*/.exec(rest) || /^_([^_]+)_/.exec(rest);
+      if (match) {
+        const node = markdownElement("em");
+        this.inline(match[1], node);
+        container.appendChild(node);
+        rest = rest.slice(match[0].length);
+        continue;
+      }
+      match = /^\[([^\]]+)\]\((https?:\/\/[^)]+)\)/.exec(rest);
+      if (match) {
+        const link = markdownElement("a", "md-link");
+        link.href = match[2];
+        link.rel = "noreferrer";
+        link.textContent = match[1];
+        container.appendChild(link);
+        rest = rest.slice(match[0].length);
+        continue;
+      }
+      match = /^https?:\/\/\S+/.exec(rest);
+      if (match) {
+        const link = markdownElement("a", "md-link");
+        link.href = match[0];
+        link.rel = "noreferrer";
+        link.textContent = match[0];
+        container.appendChild(link);
+        rest = rest.slice(match[0].length);
+        continue;
+      }
+      const special = /[`*_\[]|https?:\/\//.exec(rest);
+      if (!special) {
+        container.appendChild(document.createTextNode(rest));
+        break;
+      }
+      if (special.index > 0) {
+        container.appendChild(document.createTextNode(rest.slice(0, special.index)));
+        rest = rest.slice(special.index);
+        continue;
+      }
+      container.appendChild(document.createTextNode(rest[0]));
+      rest = rest.slice(1);
+    }
+  }
+}
+
+function renderMarkdown(container, text) {
+  const writer = new MarkdownWriter(container);
+  writer.feed(text);
+  writer.flush();
+}
+
+function finishReply() {
+  if (replyWriter) {
+    replyWriter.flush();
+    replyWriter = null;
+  }
+  openReply = null;
+}
+
 function renderToolDisplay(display) {
   if (!display || display.kind === "collapsed") return;
   const item = document.createElement("li");
@@ -104,7 +259,9 @@ function renderToolDisplay(display) {
           : line.startsWith("-")
             ? "diff-remove"
             : ""
-        : "";
+        : line.startsWith("! ")
+          ? "stderr"
+          : "";
     addRow(line, className);
   }
   if (display.omitted) addRow(`... (${display.omitted} more lines) ...`, "tool-elided");
@@ -123,7 +280,14 @@ function renderTranscript(messages) {
       .map((block) => block.text)
       .join("");
     const calls = (message.content || []).filter((block) => block.type === "tool_call");
-    if (text) addMessage(message.role, text);
+    if (text) {
+      if (message.role === "assistant") {
+        const body = addMessage("assistant", "");
+        renderMarkdown(body, text);
+      } else {
+        addMessage(message.role, text);
+      }
+    }
     for (const call of calls) addNote(`tool call: ${call.name}`);
   }
 }
@@ -257,6 +421,7 @@ function parseFrame(raw) {
 }
 
 let openReply = null;
+let replyWriter = null;
 
 function apply(frame) {
   if (frame.id !== null && frame.id > lastSeq) lastSeq = frame.id;
@@ -267,10 +432,14 @@ function apply(frame) {
       setPauseRequested(false);
       setBusy(true);
       openReply = addMessage("assistant", "");
+      replyWriter = new MarkdownWriter(openReply);
       break;
     case "text_delta":
-      if (!openReply) openReply = addMessage("assistant", "");
-      openReply.appendChild(document.createTextNode(payload.text));
+      if (!openReply) {
+        openReply = addMessage("assistant", "");
+        replyWriter = new MarkdownWriter(openReply);
+      }
+      if (replyWriter) replyWriter.feed(payload.text);
       openReply.scrollIntoView({ block: "end" });
       break;
     case "reasoning_delta":
@@ -282,7 +451,7 @@ function apply(frame) {
       break;
     case "turn_paused":
       setBusy(false);
-      openReply = null;
+      finishReply();
       if (payload.usage && (payload.usage.input_tokens || payload.usage.output_tokens)) {
         addNote(`${payload.usage.input_tokens} in / ${payload.usage.output_tokens} out tokens`);
       }
@@ -295,7 +464,7 @@ function apply(frame) {
       break;
     case "turn_finished":
       setBusy(false);
-      openReply = null;
+      finishReply();
       if (payload.usage && (payload.usage.input_tokens || payload.usage.output_tokens)) {
         addNote(`${payload.usage.input_tokens} in / ${payload.usage.output_tokens} out tokens`);
       }
@@ -314,12 +483,12 @@ function apply(frame) {
       break;
     case "turn_failed":
       setBusy(false);
-      openReply = null;
+      finishReply();
       addNote(`failed: ${payload.message}`);
       break;
     case "cancelled":
       setBusy(false);
-      openReply = null;
+      finishReply();
       addNote("cancelled");
       refreshSessions();
       break;
@@ -329,6 +498,7 @@ function apply(frame) {
     case "resync":
       // Events were dropped. The transcript is the source of truth.
       say("resyncing…", "warn");
+      finishReply();
       api(`/api/sessions/${encodeURIComponent(currentSession)}`)
         .then((snapshot) => renderTranscript(snapshot.transcript))
         .catch(() => {});
