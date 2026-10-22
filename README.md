@@ -450,6 +450,11 @@ The fields inside `[providers.<id>]` are:
 - `models` is a hand-maintained list. OpenCode Go has no `/models` endpoint (requests return
   404), so the list is configuration rather than discovery.
 
+An assistant message keeps the reasoning the provider streamed with it, and the adapter sends
+it back as `reasoning_content` on the next request. Thinking-mode models reject the request that
+continues a tool call without it. Reasoning is printed only with `--show-reasoning`; it is never
+part of the reply text.
+
 ---
 
 ## Troubleshooting
@@ -522,18 +527,18 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 231 offline tests; no network, no API key needed
+cargo test                        # 235 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
 Tests replay recorded SSE streams from the live endpoint
 (`crates/smith-providers/tests/fixtures/`) rather than hand-written JSON. The fixtures cover the
-empty-`choices` usage chunk and the separate `reasoning_content` channel. A scripted
-`MockProvider` and `MockTool` (`smith-core/src/mock.rs`) exercise the session layer, the tool
-loop, CLI rendering and the web API. One web test opens a real socket, which proves the bound
-address is loopback. The worker's provider-listener tests bind loopback on an ephemeral port,
-because that listener parses HTTP itself.
+empty-`choices` usage chunk, the separate `reasoning_content` channel and a thinking-mode tool
+call. A scripted `MockProvider` and `MockTool` (`smith-core/src/mock.rs`) exercise the session
+layer, the tool loop, CLI rendering and the web API. One web test opens a real socket, which
+proves the bound address is loopback. The worker's provider-listener tests bind loopback on an
+ephemeral port, because that listener parses HTTP itself.
 
 Five tests are ignored because they build the image and start containers:
 

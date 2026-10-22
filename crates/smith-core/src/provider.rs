@@ -72,7 +72,9 @@ impl ChatRequest {
 pub enum ProviderEvent {
     TextDelta(String),
     /// Reasoning/thinking tokens, kept separate from the answer. Providers that emit
-    /// `reasoning_content` (OpenCode Go does for GLM and others) produce this event.
+    /// `reasoning_content` (OpenCode Go does for GLM and others) produce this event. The
+    /// accumulator stores the concatenation on the assistant message so an adapter can replay
+    /// it; `Message::text` never contains it.
     ReasoningDelta(String),
     ToolCallDelta {
         /// Position in the tool-call array. Fragments belonging to one call share an index.

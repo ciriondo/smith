@@ -120,7 +120,9 @@ Core boundaries:
   Frontends keep no copy of their own.
 - Provider adapters implement native API protocols and wire formats. Shared transport implements
   HTTP and SSE mechanics. Adapters serialize `ChatRequest` and emit provider-independent
-  `ProviderEvent`s. Agent and frontend behavior must not depend on native response shapes.
+  `ProviderEvent`s. Agent and frontend behavior must not depend on native response shapes. An
+  adapter decides whether to replay the reasoning stored on a message; the OpenAI-compatible
+  adapter sends it as `reasoning_content`.
 - `smith-core/src/agent.rs` is a pure state machine from borrowed stream events to an owned
   message (`TurnAccumulator`). Keep I/O and presentation out of it.
 - Behavior shared by the interactive, one-shot and web frontends belongs in the session actor
@@ -157,9 +159,11 @@ Core boundaries:
 - The session actor owns the only mutable conversation state. Frontends hold `SessionHandle`
   clones. Do not add global mutable state. Spawned tasks must not outlive the session they
   serve.
-- The transcript is the model-visible conversation. Reasoning is not part of it.
-  `ReasoningDelta` is a separate channel, hidden unless `--show-reasoning`, and never added to
-  the transcript.
+- The transcript is the model-visible conversation. An assistant message keeps the reasoning
+  the provider streamed with it in `Message.reasoning`, because thinking-mode models require it
+  on the next request. No frontend renders the field and `Message::text()` ignores it.
+  `ReasoningDelta` remains a separate channel, hidden unless `--show-reasoning`, and the
+  adapter decides whether to replay the stored value.
 - The CLI's reply goes to stdout. Diagnostics (reasoning, usage, tool blocks and errors) go to
   stderr. Exit codes `0`, `1` and `130` are a scripting contract. `render_turn` takes a `Theme`
   and generic writers so tests can check output and codes byte for byte. Keep that signature.

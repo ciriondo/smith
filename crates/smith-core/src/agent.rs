@@ -43,8 +43,6 @@ pub struct ToolArgError {
 pub struct TurnResult {
     pub message: Message,
     pub usage: Usage,
-    /// Reasoning tokens, if the provider emitted any. Not part of the transcript.
-    pub reasoning: String,
     pub stop_reason: StopReason,
     pub tool_arg_errors: Vec<ToolArgError>,
 }
@@ -145,9 +143,13 @@ impl TurnAccumulator {
             message: Message {
                 role: Role::Assistant,
                 content,
+                reasoning: if self.reasoning.is_empty() {
+                    None
+                } else {
+                    Some(self.reasoning)
+                },
             },
             usage: self.usage,
-            reasoning: self.reasoning,
             stop_reason,
             tool_arg_errors: errors,
         }
@@ -418,6 +420,7 @@ pub async fn run_agent(
                     content,
                     is_error: !ok,
                 }],
+                reasoning: None,
             };
             messages.push(message.clone());
             added.push(message);
@@ -472,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_is_kept_out_of_the_transcript() {
+    fn reasoning_travels_with_the_message_but_not_the_text() {
         let mut acc = TurnAccumulator::new();
         acc.apply(&ProviderEvent::ReasoningDelta("thinking".into()));
         acc.apply(&ProviderEvent::TextDelta("ok".into()));
@@ -482,7 +485,7 @@ mod tests {
 
         let turn = acc.finish();
         assert_eq!(turn.message.text(), "ok");
-        assert_eq!(turn.reasoning, "thinking");
+        assert_eq!(turn.message.reasoning.as_deref(), Some("thinking"));
     }
 
     /// Arguments arrive split across several deltas and are only valid JSON after
@@ -576,6 +579,48 @@ mod tests {
         acc.apply(&ProviderEvent::TextDelta("hi".into()));
         let turn = acc.finish();
         assert_eq!(turn.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn the_follow_up_request_replays_the_reasoning() {
+        let provider = crate::mock::MockProvider::new("mock");
+        provider.push_events(vec![
+            ProviderEvent::ReasoningDelta("need the file".into()),
+            delta(
+                0,
+                Some("c1"),
+                Some("read_file"),
+                r#"{"path":"/etc/hostname"}"#,
+            ),
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+
+        let tool: Arc<dyn Tool> = Arc::new(crate::mock::MockTool::new("read_file", "host"));
+        let request = ChatRequest::new("mock-1", vec![Message::user("go")], "session");
+        let outcome = run_agent(
+            &provider,
+            &[tool],
+            Path::new("."),
+            request,
+            PauseToken::default(),
+            CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .expect("the turn completes");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "one call per model step");
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.has_tool_calls())
+            .expect("the follow-up carries the tool call");
+        assert_eq!(assistant.reasoning.as_deref(), Some("need the file"));
+        assert_eq!(outcome.final_message.unwrap().text(), "done");
     }
 
     #[tokio::test]

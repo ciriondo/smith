@@ -1,0 +1,48 @@
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":"The"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" user wants me to read"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" /etc/os-release and"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" explain which"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" distribution and version it"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" is. Let"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" me call"}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","reasoning_content":" the tool."}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_00_hkfnkf0e9vski9au7rm6xsr2","type":"function","function":{"name":"read_file"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"path"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":": "}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"/"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"etc"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"/os"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"-release"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}
+
+data: {"id":"f867a5f986146561f07cc01207537306","object":"chat.completion.chunk","created":1792636266,"model":"deepseek-v4.1-flash","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant"}}],"usage":{"prompt_tokens":307,"completion_tokens":66,"total_tokens":373,"prompt_tokens_details":{"audio_tokens":0,"cached_tokens":256,"cache_creation_input_tokens":0,"cache_write_tokens":0},"completion_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"reasoning_tokens":25,"rejected_prediction_tokens":0}}}
+
+data: [DONE]
+

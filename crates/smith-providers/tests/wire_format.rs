@@ -4,7 +4,7 @@
 //! (`POST https://opencode.ai/inference/go/openai/v1/chat/completions`), so the wire format is
 //! tested against recorded traffic rather than documentation.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use smith_core::agent::TurnAccumulator;
 use smith_core::provider::{ChatRequest, ProviderEvent, ToolSpec};
@@ -63,14 +63,16 @@ fn plain_stream_assembles_text_and_usage() {
 fn reasoning_arrives_on_its_own_channel() {
     let turn = replay("glm-plain.sse").finish();
 
-    // GLM on OpenCode Go emits `reasoning_content` deltas alongside `content`. They must be
-    // kept out of the transcript but must not be dropped either.
+    // GLM on OpenCode Go emits `reasoning_content` deltas alongside `content`. They are kept
+    // out of the reply text but retained on the message for the next request.
+    let reasoning = turn
+        .message
+        .reasoning
+        .as_deref()
+        .expect("expected reasoning_content deltas in the fixture");
+    assert!(!reasoning.is_empty());
     assert!(
-        !turn.reasoning.is_empty(),
-        "expected reasoning_content deltas in the fixture"
-    );
-    assert!(
-        !turn.message.text().contains(&turn.reasoning),
+        !turn.message.text().contains(reasoning),
         "reasoning must not leak into the reply text"
     );
 }
@@ -88,6 +90,27 @@ fn tool_call_stream_assembles_arguments() {
     assert_eq!(name, "read_file");
     assert_eq!(args, &json!({"path": "/etc/hostname"}));
     assert!(turn.tool_arg_errors.is_empty());
+}
+
+/// DeepSeek in thinking mode streams reasoning before a tool call. The reasoning belongs to
+/// the assistant message, because the next request must send it back.
+#[test]
+fn thinking_tool_call_retains_reasoning_on_the_message() {
+    let turn = replay("deepseek-toolcall-thinking.sse").finish();
+
+    assert_eq!(turn.stop_reason, StopReason::ToolUse);
+    let reasoning = turn
+        .message
+        .reasoning
+        .as_deref()
+        .expect("expected reasoning_content deltas in the fixture");
+    assert!(reasoning.starts_with("The user wants me to read"));
+    assert!(reasoning.ends_with("Let me call the tool."));
+
+    let calls: Vec<_> = turn.message.tool_calls().collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "read_file");
+    assert_eq!(calls[0].2, &json!({"path": "/etc/os-release"}));
 }
 
 #[test]
@@ -142,6 +165,45 @@ fn body_puts_system_prompt_first_and_enables_streaming() {
     assert_eq!(body["messages"][1]["content"], json!("hi"));
 }
 
+/// A thinking-mode model rejects the continuation request unless the assistant message carries
+/// the reasoning it produced. The field is written only when the message has reasoning.
+#[test]
+fn body_replays_reasoning_on_assistant_messages() {
+    let mut assistant = Message::assistant("");
+    assistant.reasoning = Some("the file is in /etc".to_string());
+    assistant.content.push(ContentBlock::ToolCall {
+        id: "call_a".into(),
+        name: "read_file".into(),
+        args: json!({"path": "/etc/os-release"}),
+    });
+    let req = ChatRequest::new(
+        "deepseek-v4.1-flash",
+        vec![Message::user("go"), assistant],
+        "session-1",
+    );
+
+    let body = build_body(&req);
+    assert_eq!(
+        body["messages"][1]["reasoning_content"],
+        json!("the file is in /etc")
+    );
+    assert_eq!(body["messages"][1]["content"], Value::Null);
+    assert_eq!(
+        body["messages"][1]["tool_calls"][0]["function"]["name"],
+        json!("read_file")
+    );
+
+    let mut plain = Message::assistant("done");
+    plain.reasoning = Some(String::new());
+    let req = ChatRequest::new("deepseek-v4.1-flash", vec![plain], "session-1");
+    let body = build_body(&req);
+    assert_eq!(
+        body["messages"][0].get("reasoning_content"),
+        None,
+        "empty reasoning must not add the field"
+    );
+}
+
 /// One core `Message` holding two tool results becomes two `role: "tool"` wire messages.
 /// This shape mismatch is why the translation exists.
 #[test]
@@ -151,6 +213,7 @@ fn tool_results_fan_out_to_separate_wire_messages() {
         content: vec![ContentBlock::Text {
             text: "checking".into(),
         }],
+        reasoning: None,
     };
     assistant.content.push(ContentBlock::ToolCall {
         id: "call_a".into(),
@@ -177,6 +240,7 @@ fn tool_results_fan_out_to_separate_wire_messages() {
                 is_error: true,
             },
         ],
+        reasoning: None,
     };
 
     let req = ChatRequest::new(

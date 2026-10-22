@@ -425,16 +425,24 @@ pub fn build_body(req: &ChatRequest) -> Value {
                 messages.push(json!({"role": "user", "content": text}));
             }
             Role::Assistant => {
+                let mut wire = json!({"role": "assistant"});
                 if calls.is_empty() {
-                    messages.push(json!({"role": "assistant", "content": text}));
+                    wire["content"] = json!(text);
                 } else {
                     // `content` must be present even when null for strict servers.
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": if text.is_empty() { Value::Null } else { json!(text) },
-                        "tool_calls": calls,
-                    }));
+                    wire["content"] = if text.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(text)
+                    };
+                    wire["tool_calls"] = json!(calls);
                 }
+                // Thinking-mode models reject the request unless the reasoning that came
+                // with an assistant message is passed back verbatim.
+                if let Some(reasoning) = message.reasoning.as_deref().filter(|r| !r.is_empty()) {
+                    wire["reasoning_content"] = json!(reasoning);
+                }
+                messages.push(wire);
             }
         }
     }

@@ -6,10 +6,11 @@
 //!
 //! Three rules apply here:
 //!
-//! * **Deltas are never persisted.** The transcript gains the user message and the assistant
-//!   message exactly once, when a turn finishes or pauses. A failed or cancelled turn leaves
-//!   the transcript untouched, so the model never sees a partial answer. A paused turn keeps
-//!   the steps that completed before the boundary.
+//! * **Stream deltas are never persisted as deltas.** The transcript gains the user message
+//!   and the assistant message exactly once, when a turn finishes or pauses. The assistant
+//!   message keeps the reasoning that arrived with it. A failed or cancelled turn leaves the
+//!   transcript untouched, so the model never sees a partial answer. A paused turn keeps the
+//!   steps that completed before the boundary.
 //! * **`Send` while a turn is running is rejected**, not queued.
 //! * **[`SessionHandle::subscribe`] subscribes before it snapshots**, and
 //!   [`Subscription::recv`] drops events that were already replayed. The opposite order
@@ -1294,6 +1295,7 @@ mod tests {
     async fn a_pause_after_a_tool_batch_records_the_steps_and_stops() {
         let provider = Arc::new(MockProvider::new("mock"));
         provider.push_events(vec![
+            ProviderEvent::ReasoningDelta("the tool will block".into()),
             tool_call_event("call_1", "blocking", "{}"),
             ProviderEvent::Done {
                 stop_reason: StopReason::ToolUse,
@@ -1329,6 +1331,16 @@ mod tests {
             3,
             "user, assistant call and tool result"
         );
+        let assistant = snapshot
+            .transcript
+            .iter()
+            .find(|message| message.has_tool_calls())
+            .expect("the paused step is recorded");
+        assert_eq!(
+            assistant.reasoning.as_deref(),
+            Some("the tool will block"),
+            "the pause keeps the reasoning with the assistant message"
+        );
         assert_eq!(tool.calls().len(), 1);
 
         session.send("steer").await.unwrap();
@@ -1341,6 +1353,16 @@ mod tests {
             requests[1].messages.len(),
             4,
             "the paused steps plus the steering message"
+        );
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.has_tool_calls())
+            .expect("the steering request replays the tool call");
+        assert_eq!(
+            assistant.reasoning.as_deref(),
+            Some("the tool will block"),
+            "the request after the pause carries the reasoning"
         );
         assert!(
             requests[1].messages.iter().any(|message| message

@@ -36,6 +36,14 @@ pub enum ContentBlock {
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    /// Reasoning the provider streamed with this assistant message.
+    ///
+    /// It is continuation state, not conversation: [`Message::text`] ignores it and no
+    /// frontend renders it. Providers that require the previous reasoning for the next request
+    /// (thinking mode with tool calls) get it back from the adapter. The field is omitted from
+    /// serialised snapshots, so the HTTP shape does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -43,6 +51,7 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+            reasoning: None,
         }
     }
 
@@ -50,6 +59,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: text.into() }],
+            reasoning: None,
         }
     }
 
@@ -130,9 +140,25 @@ mod tests {
                     args: serde_json::json!({"path": "/etc/hostname"}),
                 },
             ],
+            reasoning: Some("the path is in the request".into()),
         };
         assert_eq!(msg.text(), "reading");
         assert!(msg.has_tool_calls());
+    }
+
+    #[test]
+    fn reasoning_is_serialised_only_when_present() {
+        let plain = Message::assistant("ok");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(json.get("reasoning"), None, "absent field stays absent");
+
+        let mut reasoned = Message::assistant("ok");
+        reasoned.reasoning = Some("thinking".into());
+        let json = serde_json::to_value(&reasoned).unwrap();
+        assert_eq!(json["reasoning"], "thinking");
+
+        let restored: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.reasoning.as_deref(), Some("thinking"));
     }
 
     #[test]
