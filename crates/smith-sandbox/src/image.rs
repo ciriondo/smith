@@ -1,8 +1,9 @@
-//! The image: an embedded Containerfile and one build per smith version.
+//! The image: an embedded base, a generated Containerfile and one build per image config.
 //!
-//! The base is pinned by digest, the build context holds only the Containerfile and the two
-//! binaries, and the tag carries the smith version and both binary digests so an upgrade or a
-//! rebuilt binary produces a new image.
+//! The base image ships inside the `smith` binary as a gzip-compressed docker archive. The
+//! first sandbox start loads it into the private store; the final image builds from the local
+//! base tag. The tag is a hash of the base, the user package list and both binary digests, so
+//! sessions with the same resolved settings reuse one image.
 
 use std::io;
 use std::path::Path;
@@ -13,9 +14,17 @@ use tokio::process::Command;
 use crate::error::SandboxError;
 use crate::supervisor::Supervisor;
 
-/// Debian 13.7, glibc 2.41. The digest was captured on 2026-10-19.
-pub const BASE: &str =
-    "debian:stable-slim@sha256:d405c1e1d9eecbf30022d23766a0eea235e7f499aa33e357dfd29271a839f82a";
+/// The local tag carried by [`BASE_ARCHIVE`]. The archive is generated from Debian 13.7
+/// (glibc 2.41) and pinned by digest; `assets/README.md` records the digest and the command.
+pub const BASE_TAG: &str = "localhost/smith-base:debian-13.7";
+
+/// The compressed docker archive of the base image. It is generated with `podman save` and
+/// embedded, so the sandbox start does not pull a base image from a registry.
+pub const BASE_ARCHIVE: &[u8] = include_bytes!("../assets/debian-slim.tar.gz");
+
+/// The Containerfile and inventory format. Bump it when either changes, so an existing image
+/// is not reused after the build logic changes.
+const IMAGE_FORMAT: u32 = 1;
 
 /// The child's system config tier. It is the only provider a sandboxed `smith` can build: the
 /// worker's listener, with the per-container token as its key.
@@ -32,15 +41,36 @@ default_model = \"proxied\"
 models = []
 ";
 
-/// The image tag: the smith version and a digest of each binary. Including both digests means
-/// a rebuilt worker or `smith` produces a new tag instead of silently reusing an older image.
-pub fn tag_for(worker_digest: &str, smith_digest: &str) -> String {
-    let worker = &worker_digest[..12.min(worker_digest.len())];
-    let smith = &smith_digest[..12.min(smith_digest.len())];
-    format!(
-        "smith-sandbox:{}-{worker}-{smith}",
-        env!("CARGO_PKG_VERSION")
-    )
+/// The image tag: a hash of the base, the resolved package list and both binary digests.
+///
+/// The package list is sorted and deduplicated here as well as in the config, so two sessions
+/// with the same packages in a different order reuse one image. The format constant is part of
+/// the hash.
+pub fn tag_for(base: &str, packages: &[String], worker_digest: &str, smith_digest: &str) -> String {
+    let mut packages = packages.to_vec();
+    packages.sort();
+    packages.dedup();
+
+    let mut hasher = Sha256::new();
+    hasher.update(IMAGE_FORMAT.to_be_bytes());
+    hash_field(&mut hasher, base.as_bytes());
+    hash_field(&mut hasher, &(packages.len() as u64).to_be_bytes());
+    for package in &packages {
+        hash_field(&mut hasher, package.as_bytes());
+    }
+    hash_field(&mut hasher, worker_digest.as_bytes());
+    hash_field(&mut hasher, smith_digest.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("smith-sandbox:{}", &hex[..16])
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 /// The sha256 of a binary, as lowercase hex.
@@ -55,48 +85,75 @@ pub fn digest(path: &Path) -> Result<String, SandboxError> {
         .collect())
 }
 
-/// The Containerfile. `gcc`, `binutils` and `libc6-dev` are present because `rustc` cannot
-/// link without them; `git` and `ca-certificates` are absent from the base image.
+/// The Containerfile for one package list.
 ///
-/// `smith-config.toml` is copied from the build context, so [`CHILD_CONFIG`] is the file the
-/// image writes rather than an escaped copy embedded in a shell command.
-pub fn containerfile() -> String {
+/// The default image is the base plus the two binaries. The optional install line is the only
+/// place a package reaches the image. The final RUN generates the inventory from the actual
+/// image and removes the package manager from the base.
+pub fn containerfile(packages: &[String]) -> String {
+    let install = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "RUN apt-get update \\\n\
+             \x20&& apt-get install -y --no-install-recommends {} \\\n\
+             \x20&& rm -rf /var/lib/apt/lists /var/cache/apt\n",
+            packages.join(" ")
+        )
+    };
+    let package_loop = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "for p in {}; do dpkg-query -L \"$p\" 2>/dev/null | while read -r f; do \
+             case \"$f\" in /usr/bin/*|/bin/*) b=${{f##*/}}; [ -x \"$f\" ] && \
+             printf '%s\\n' \"$b\";; esac; done; done; ",
+            packages.join(" ")
+        )
+    };
+
     format!(
-        "FROM {BASE}\n\
-         RUN apt-get update \\\n\
-         \x20&& apt-get install -y --no-install-recommends bash coreutils git gcc libc6-dev binutils ca-certificates \\\n\
-         \x20&& rm -rf /var/lib/apt/lists /var/cache/apt /etc/apt /var/lib/dpkg \\\n\
-         \x20&& rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg /usr/bin/dpkg-deb \\\n\
-         \x20&& mkdir -p /etc/smith \\\n\
-         \x20&& printf '%s\\n' bash sh cat cp mv rm mkdir ls grep sed awk git gcc ld tar gzip find head tail wc sort uniq cut tr env sleep true false printf smith > /etc/smith/inventory.txt\n\
+        "FROM {BASE_TAG}\n\
+         {install}\
+         RUN mkdir -p /etc/smith\n\
          COPY smith-worker /usr/local/bin/smith-worker\n\
          COPY smith /usr/local/bin/smith\n\
          COPY smith-config.toml /etc/smith/config.toml\n\
-         RUN chmod 755 /usr/local/bin/smith-worker /usr/local/bin/smith\n"
+         RUN {{ for c in bash sh cat cp mv rm mkdir ls grep sed awk tar gzip find head tail wc sort uniq cut tr env sleep true false printf du perl git gcc ld; do command -v \"$c\" >/dev/null 2>&1 && printf '%s\\n' \"$c\"; done; \
+         {package_loop}printf '%s\\n' smith; }} | sort -u > /etc/smith/inventory.txt \\\n\
+         \x20&& rm -rf /var/lib/apt/lists /var/cache/apt /etc/apt /var/lib/dpkg \\\n\
+         \x20&& rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg /usr/bin/dpkg-deb\n"
     )
 }
 
-/// Build the image when it does not exist. The first build pulls the base and the packages.
+/// Build the image when it does not exist. The base is loaded from the embedded archive when
+/// the private store does not contain it; the final build never pulls an image.
 pub async fn ensure(
     supervisor: &Supervisor,
     worker: &Path,
     smith: &Path,
+    packages: &[String],
     tag: &str,
 ) -> Result<(), SandboxError> {
     if exists(supervisor, tag).await? {
         return Ok(());
     }
 
-    eprintln!("smith: sandbox: building the image, this pulls {BASE}");
+    ensure_base(supervisor).await?;
+
+    eprintln!("smith: sandbox: building the image from {BASE_TAG}");
     let context = tempfile::tempdir()?;
-    std::fs::write(context.path().join("Containerfile"), containerfile())?;
+    std::fs::write(
+        context.path().join("Containerfile"),
+        containerfile(packages),
+    )?;
     copy_binary(worker, &context.path().join("smith-worker"))?;
     copy_binary(smith, &context.path().join("smith"))?;
     std::fs::write(context.path().join("smith-config.toml"), CHILD_CONFIG)?;
 
     let output = Command::new("podman")
         .args(supervisor.global_args())
-        .args(["build", "--pull=missing", "-t", tag])
+        .args(["build", "--pull=never", "-t", tag])
         .arg(context.path())
         .output()
         .await
@@ -108,6 +165,37 @@ pub async fn ensure(
     if !output.status.success() {
         return Err(SandboxError::Podman(format!(
             "image build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Load the embedded base archive when the private store does not have it.
+async fn ensure_base(supervisor: &Supervisor) -> Result<(), SandboxError> {
+    if exists(supervisor, BASE_TAG).await? {
+        return Ok(());
+    }
+
+    eprintln!("smith: sandbox: loading the embedded base image {BASE_TAG}");
+    let directory = tempfile::tempdir()?;
+    let archive = directory.path().join("base.tar.gz");
+    std::fs::write(&archive, BASE_ARCHIVE)?;
+
+    let output = Command::new("podman")
+        .args(supervisor.global_args())
+        .args(["load", "-i"])
+        .arg(&archive)
+        .output()
+        .await
+        .map_err(|source| SandboxError::Spawn {
+            command: "podman load".to_string(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(SandboxError::Podman(format!(
+            "base image load failed:\n{}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -144,15 +232,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_containerfile_pins_the_base_and_removes_the_package_manager() {
-        let text = containerfile();
-        assert!(text.contains(BASE));
-        assert!(text.contains("libc6-dev"));
+    fn the_default_containerfile_has_the_base_binaries_and_no_packages() {
+        let text = containerfile(&[]);
+        assert!(text.contains(&format!("FROM {BASE_TAG}")));
+        assert!(!text.contains("apt-get install"));
         assert!(text.contains("inventory.txt"));
         assert!(text.contains("rm -f /usr/bin/apt"));
         assert!(text.contains("COPY smith-worker /usr/local/bin/smith-worker"));
         assert!(text.contains("COPY smith /usr/local/bin/smith"));
         assert!(text.contains("COPY smith-config.toml /etc/smith/config.toml"));
+        assert!(!text.contains("chmod 755"));
+    }
+
+    #[test]
+    fn the_containerfile_installs_the_configured_packages() {
+        let text = containerfile(&["git".to_string(), "gcc".to_string()]);
+        assert!(text.contains("apt-get install -y --no-install-recommends git gcc"));
+        assert!(text.contains("for p in git gcc;"));
+        assert!(text.contains("dpkg-query -L"));
+    }
+
+    #[test]
+    fn the_base_archive_is_embedded_and_compressed() {
+        assert!(BASE_ARCHIVE.len() > 1024);
+        assert_eq!(&BASE_ARCHIVE[..2], &[0x1f, 0x8b]);
+    }
+
+    #[test]
+    fn the_tag_is_stable_and_package_order_does_not_matter() {
+        let a = tag_for(
+            BASE_TAG,
+            &["gcc".to_string(), "git".to_string()],
+            "0123456789abcdef0123",
+            "fedcba98765432100123",
+        );
+        let b = tag_for(
+            BASE_TAG,
+            &["git".to_string(), "gcc".to_string(), "git".to_string()],
+            "0123456789abcdef0123",
+            "fedcba98765432100123",
+        );
+        assert_eq!(a, b);
+        assert!(a.starts_with("smith-sandbox:"));
+        assert_eq!(a.len(), "smith-sandbox:".len() + 16);
+    }
+
+    #[test]
+    fn the_tag_changes_with_packages_and_binaries() {
+        let base = tag_for(
+            BASE_TAG,
+            &[],
+            "0123456789abcdef0123",
+            "fedcba98765432100123",
+        );
+        assert_ne!(
+            base,
+            tag_for(
+                BASE_TAG,
+                &["git".to_string()],
+                "0123456789abcdef0123",
+                "fedcba98765432100123"
+            )
+        );
+        assert_ne!(
+            base,
+            tag_for(
+                BASE_TAG,
+                &[],
+                "ffffffffffffffffffff",
+                "fedcba98765432100123"
+            )
+        );
     }
 
     /// The child config has to load through the same tier the container uses. A new provider
@@ -171,17 +321,6 @@ mod tests {
         assert_eq!(
             provider.kind,
             smith_core::config::ProviderKind::OpenAiCompat
-        );
-    }
-
-    #[test]
-    fn the_tag_carries_the_version_and_both_digests() {
-        assert_eq!(
-            tag_for("0123456789abcdef0123", "fedcba98765432100123"),
-            format!(
-                "smith-sandbox:{}-0123456789ab-fedcba987654",
-                env!("CARGO_PKG_VERSION")
-            )
         );
     }
 }

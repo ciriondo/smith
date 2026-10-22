@@ -217,6 +217,13 @@ struct FileSandbox {
     network: Option<FileNetwork>,
     mounts: Option<FileMounts>,
     env: Option<FileEnv>,
+    image: Option<FileImage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileImage {
+    packages: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -528,6 +535,13 @@ impl std::fmt::Display for NetworkEntry {
     }
 }
 
+/// The sandbox image settings after merging every tier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxImageSettings {
+    /// Debian packages installed into the image. The default list is empty.
+    pub packages: Vec<String>,
+}
+
 /// The sandbox settings after merging every tier.
 #[derive(Debug, Clone)]
 pub struct SandboxSettings {
@@ -537,6 +551,7 @@ pub struct SandboxSettings {
     pub rw_mounts: Vec<PathBuf>,
     pub env_inherit: Vec<String>,
     pub env_set: BTreeMap<String, String>,
+    pub image: SandboxImageSettings,
 }
 
 impl Default for SandboxSettings {
@@ -548,6 +563,7 @@ impl Default for SandboxSettings {
             rw_mounts: Vec::new(),
             env_inherit: Vec::new(),
             env_set: BTreeMap::new(),
+            image: SandboxImageSettings::default(),
         }
     }
 }
@@ -646,12 +662,19 @@ fn merge_sandbox(loaded: &[(Tier, PathBuf, FileConfig)]) -> Result<SandboxSettin
     let mut rw = Vec::new();
     let mut ro_set = false;
     let mut rw_set = false;
+    let mut image_packages = Vec::new();
 
     for (tier, path, file) in loaded {
         let Some(sandbox) = &file.sandbox else {
             continue;
         };
         if *tier == Tier::Project {
+            if sandbox.image.is_some() {
+                return Err(config_error(
+                    path,
+                    "[sandbox.image] belongs in the system or user config",
+                ));
+            }
             if sandbox.mounts.is_some() {
                 return Err(config_error(
                     path,
@@ -702,7 +725,25 @@ fn merge_sandbox(loaded: &[(Tier, PathBuf, FileConfig)]) -> Result<SandboxSettin
                 }
             }
         }
+        if let Some(image) = &sandbox.image {
+            if let Some(packages) = &image.packages {
+                for name in packages {
+                    if !valid_image_package(name) {
+                        return Err(config_error(
+                            path,
+                            &format!(
+                                "invalid sandbox image package '{name}': use a Debian package \
+                                 name (lowercase letters, digits, '+', '-' and '.')"
+                            ),
+                        ));
+                    }
+                    image_packages.push(name.clone());
+                }
+            }
+        }
     }
+    image_packages.sort();
+    image_packages.dedup();
 
     let mut allow = Vec::new();
     for (path, list) in &allow_lists {
@@ -746,7 +787,21 @@ fn merge_sandbox(loaded: &[(Tier, PathBuf, FileConfig)]) -> Result<SandboxSettin
         rw_mounts: if rw_set { rw } else { Vec::new() },
         env_inherit: inherit,
         env_set,
+        image: SandboxImageSettings {
+            packages: image_packages,
+        },
     })
+}
+
+fn valid_image_package(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
 }
 
 fn intersect_names(lists: &[(PathBuf, Vec<String>)]) -> Vec<String> {
@@ -1009,6 +1064,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("[sandbox.mounts]"), "{error}");
+    }
+
+    #[test]
+    fn image_packages_union_and_sort_across_tiers() {
+        let cfg = load_named(
+            "image-packages",
+            &[
+                (
+                    Tier::User,
+                    "[sandbox.image]\npackages = [\"gcc\", \"git\", \"git\"]\n",
+                ),
+                (Tier::System, "[sandbox.image]\npackages = [\"binutils\"]\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.sandbox.image.packages,
+            vec!["binutils".to_string(), "gcc".to_string(), "git".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_project_image_table_is_an_error() {
+        let error = load_named(
+            "project-image",
+            &[(Tier::Project, "[sandbox.image]\npackages = [\"git\"]\n")],
+        )
+        .unwrap_err();
+        assert!(error.contains("[sandbox.image]"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_image_package_name_is_rejected() {
+        let error = load_named(
+            "invalid-image",
+            &[(
+                Tier::User,
+                "[sandbox.image]\npackages = [\"git; rm -rf /\"]\n",
+            )],
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid sandbox image package"), "{error}");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use smith_channel::{
     ProviderData, ProviderEnd, ProviderFailure, ProviderHead, ProviderRequest, ToolCall,
     ToolResult, PROTOCOL_VERSION,
 };
-use smith_core::config::NetworkEntry;
+use smith_core::config::{NetworkEntry, SandboxImageSettings};
 use smith_core::{ProviderProxy, ProxyEvent, ToolError};
 use tokio::process::Command;
 use tokio::runtime::Handle;
@@ -48,6 +48,8 @@ pub struct SandboxConfig {
     pub ro_mounts: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub idle_timeout: Duration,
+    /// The packages installed into the session's image. The default is empty.
+    pub image: SandboxImageSettings,
     /// The host endpoint for a sandboxed child's provider calls, with the parent's
     /// credential. `None` makes those calls fail.
     pub provider: Option<Arc<dyn ProviderProxy>>,
@@ -95,8 +97,13 @@ impl Supervisor {
     pub async fn start(&self, config: &SandboxConfig) -> Result<Arc<Sandbox>, SandboxError> {
         let worker = worker_binary()?;
         let smith = smith_binary()?;
-        let tag = image::tag_for(&image::digest(&worker)?, &image::digest(&smith)?);
-        image::ensure(self, &worker, &smith, &tag).await?;
+        let tag = image::tag_for(
+            image::BASE_TAG,
+            &config.image.packages,
+            &image::digest(&worker)?,
+            &image::digest(&smith)?,
+        );
+        image::ensure(self, &worker, &smith, &config.image.packages, &tag).await?;
 
         let (host, worker) = UnixStream::pair()?;
         host.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;

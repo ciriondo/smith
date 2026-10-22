@@ -293,6 +293,7 @@ fn build_manager(
                     ro_mounts: settings.ro_mounts.clone(),
                     env,
                     idle_timeout: settings.idle_timeout,
+                    image: settings.image.clone(),
                     provider: proxy,
                 };
                 smith_sandbox::sandbox_tools(supervisor.clone(), sandbox)

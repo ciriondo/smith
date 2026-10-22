@@ -18,7 +18,7 @@ cargo clippy --all-targets -- -D warnings
 All build, test and lint commands go through cargo. There is no wrapper script or second build
 system. `smith` is the only binary. `cargo run -q -p smith-cli -- …` runs it during development.
 The default test suite is offline. It requires no API key and no external network access. The
-only sockets it opens are bound to loopback. Three tests are ignored: they build the sandbox
+only sockets it opens are bound to loopback. Five tests are ignored: they build the sandbox
 image and start containers, so they need podman and network. Run them with
 `cargo test -p smith-sandbox -- --ignored` after `cargo build --workspace`.
 
@@ -140,7 +140,14 @@ Core boundaries:
   host proxy in `smith-providers/src/proxy.rs` replaces the child's model and sends the parent's
   headers; only the request body comes from the child. The worker inserts
   `SMITH_SANDBOX_TOKEN` after the configured environment, so a configured value cannot replace
-  it. The image contains both `smith` and `smith-worker`, and its tag carries both digests.
+  it.
+- The sandbox image has an embedded base and a config-keyed cache. The base archive is
+  `crates/smith-sandbox/assets/debian-slim.tar.gz`, loaded with `podman load` when the private
+  store lacks `localhost/smith-base:debian-13.7`. The final tag hashes the base tag, the sorted
+  `[sandbox.image] packages` and both binary digests. The default package list is empty; a
+  non-empty list is installed with `--no-install-recommends`. The package list belongs to the
+  system or user config; a project file that sets it is an error. The inventory is generated
+  from the final image, not a fixed list.
 - Declare user-facing settings in `Config` and `FileConfig`, and consume them by field. The
   direct environment reads are the documented config layers (`SMITH_MODEL`, `SMITH_PROVIDER`),
   environment-only secrets (`api_key_env`), the binary locations (`SMITH_BIN`,
@@ -177,8 +184,8 @@ Extension workflows:
 
 ## Tests
 
-The default test run is `cargo test` and must stay offline. The sandbox's container test is
-ignored; it needs podman, a built worker and network.
+The default test run is `cargo test` and must stay offline. The sandbox's five container tests
+are ignored; they need podman, the built binaries and network.
 
 - Unit tests are in a `#[cfg(test)] mod tests` in the module they exercise. Integration tests
   are in `crates/<crate>/tests/` and cover behavior the public API exposes across module

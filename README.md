@@ -29,8 +29,9 @@ The project is at an early stage. It is not ready for use on an arbitrary reposi
   dependency graph and fails before any test runs. See [Toolchain](#toolchain).
 - An OpenCode Go subscription and its API key.
 - Network access to `opencode.ai`.
-- Rootless podman 4.9 or newer for the sandbox, and network access on the first run to pull the
-  base image and its packages.
+- Rootless podman 4.9 or newer for the sandbox. The base image ships inside `smith`. A
+  non-empty `[sandbox.image] packages` list needs network access on the first build of that
+  package set.
 - The `smith-worker` binary next to `smith`, or `SMITH_WORKER_BIN` naming it. `cargo build`
   produces both. The container runs tools, so smith refuses to start without a worker.
 
@@ -235,10 +236,15 @@ start, the turn fails and smith prints why.
   path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`.
 - The environment is computed rather than inherited. Values travel over the channel and never
   appear in the container's command line.
-- The image is built on first use from a Containerfile embedded in the `smith` binary, with a
-  digest-pinned base. It contains `smith`, `smith-worker` and the child provider config. The
-  image tag includes both binary digests, so a rebuilt binary produces a new image. The build
-  pulls roughly 150 MB, once per private store.
+- The base image ships inside the `smith` binary as a compressed docker archive and is loaded
+  into the private store on first use. The final image builds from a generated Containerfile
+  and contains `smith`, `smith-worker`, the child provider config and a generated inventory.
+  The default image is about 123 MB and has no compiler, Git or CA certificates.
+- Extra tools come from `[sandbox.image] packages` in the system or user config. The names are
+  Debian package names; the build uses `--no-install-recommends`. Adding `git` installs Perl
+  through Git's package dependency; add `ca-certificates` for HTTPS. A package set is cached
+  by a tag that hashes the base, the package list and both binary digests, so sessions with
+  the same resolved settings reuse the image. The default list is empty.
 - A session's container stops after `[sandbox] idle_timeout` without activity, on disconnect
   and on process exit. Process state does not survive a stop; the filesystem does, through the
   workspace and the caches.
@@ -360,6 +366,9 @@ ro = ["/home/chris/.rustup", "/home/chris/.cargo/bin"]
 inherit = ["RUST_BACKTRACE"]
 set = { CARGO_TERM_COLOR = "never" }
 
+[sandbox.image]
+packages = ["git", "ca-certificates", "gcc", "libc6-dev", "binutils"]
+
 [policy]
 managed = true
 ```
@@ -372,11 +381,13 @@ managed = true
 | `sandbox.mounts.rw` | Extra writable mounts. Default empty |
 | `sandbox.env.inherit` | Host variable names copied into the sandbox |
 | `sandbox.env.set` | Literal variables |
+| `sandbox.image.packages` | Debian packages installed into the session image. Default empty. The base provides the shell and coreutils |
 | `policy.managed` | Reject project files that set a sandbox list |
 
 `allow` and `inherit` intersect across the tiers that set them, so a project file can narrow a
-list and never widen it. `mounts` and `policy` belong to the system or user file; a project file
-that sets either is an error. The credential deny list (`SSH_AUTH_SOCK`, `PODMAN_*`, `AWS_*`,
+list and never widen it. `mounts`, `image` and `policy` belong to the system or user file; a
+project file that sets any of them is an error. Package lists from the system and user tiers
+are unioned, sorted and deduplicated. The credential deny list (`SSH_AUTH_SOCK`, `PODMAN_*`, `AWS_*`,
 `*_TOKEN`, `EDITOR` and others) is enforced at load time, and a refused name is an error naming
 the reason.
 
@@ -410,7 +421,11 @@ The messages below are the text smith prints.
 | `cannot find the worker binary at ...; run cargo build -p smith-worker or set SMITH_WORKER_BIN` | The sandbox needs `smith-worker` next to `smith`. `cargo build` builds both. |
 | `cannot find the smith binary at ...; run cargo build -p smith-cli or set SMITH_BIN` | The image needs `smith` to run a sandboxed child. `cargo build` builds it. |
 | `unknown field `provider`` | A config file from an older schema. The key is `[providers.<id>]`; smith rejects the file rather than migrating it. |
-| `the sandbox worker did not answer within 10s` | podman started but the channel did not complete. Check that the image starts (`podman --root ~/.local/share/smith/containers/storage run --rm smith-sandbox:<version> true`) and that the worker matches the smith version. |
+| `the sandbox worker did not answer within 10s` | podman started but the channel did not complete. Check that the image starts (`podman --root ~/.local/share/smith/containers/storage images` shows the `smith-sandbox:<hash>` tag) and that the worker matches the smith version. |
+| `invalid sandbox image package 'x': ...` | `[sandbox.image] packages` contains a name that is not a Debian package name. Use lowercase letters, digits, `+`, `-` and `.`. |
+| `[sandbox.image] belongs in the system or user config` | A project file set the image package list. Move it to the system or user file. |
+| `base image load failed: ...` | podman could not load the embedded base archive. Check podman and the private store. |
+| `image build failed: ...` | The package install or the final image step failed. Check the package names and the host network. |
 | `... Model is unavailable.` | The model id is wrong or not included in the plan. Run `smith providers list`, or check the model table in the OpenCode Go documentation. |
 | `configuration error: unknown provider 'x'; configured providers: opencode-go` | The error indicates a typo in `-m` or `SMITH_MODEL`. It lists the configured providers. |
 | `configuration error: refusing to bind 0.0.0.0: smith serve is reachable from localhost only...` | `--bind` was not a loopback address. Use `127.0.0.1` or `::1`. This is a hard error because a routable bind would expose the service. |
@@ -463,7 +478,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 199 offline tests; no network, no API key needed
+cargo test                        # 205 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -476,17 +491,21 @@ loop, CLI rendering and the web API. One web test opens a real socket, which pro
 address is loopback. The worker's provider-listener tests bind loopback on an ephemeral port,
 because that listener parses HTTP itself.
 
-Three tests are ignored because they build the image and start containers:
+Five tests are ignored because they build the image and start containers:
 
 ```sh
 cargo build --workspace
 cargo test -p smith-sandbox -- --ignored
 ```
 
-The first runs `run_shell` and `write_file` against a container. The second runs `cargo fetch`
-through the proxy and checks that a host outside the allowlist is refused. The third runs
-`smith -p` inside the container with a fake host proxy: the child's answer comes back through
-the channel, and the container environment holds the proxy token but not the provider key.
+The first runs `run_shell` and `write_file` against the default image and checks the generated
+inventory and the missing package manager. The second runs `cargo fetch` and `git ls-remote`
+through the proxy with a package list that adds Git and CA certificates, and checks the Perl-based
+Git tools are present. The third runs `smith -p` inside the container with a fake host proxy: the
+child's answer comes back through the channel, and the container environment holds the proxy
+token but not the provider key. The fourth installs the compiler packages and builds a C program
+and a Rust crate. The fifth starts two sessions with the same package list and checks that the
+image tag and image are reused.
 
 ### Toolchain
 

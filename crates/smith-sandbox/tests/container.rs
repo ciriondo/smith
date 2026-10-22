@@ -1,10 +1,11 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use serde_json::json;
-use smith_core::config::{NetworkEntry, SandboxSettings};
+use smith_core::config::{NetworkEntry, SandboxImageSettings, SandboxSettings};
 use smith_core::{ProviderError, ProviderProxy, ProxyEvent};
 use smith_sandbox::{standard_env, SandboxConfig, Supervisor};
 use tokio::sync::mpsc;
@@ -37,6 +38,45 @@ fn worker() -> PathBuf {
 
 fn smith() -> PathBuf {
     sibling("smith")
+}
+
+fn image_tag(packages: &[String]) -> String {
+    smith_sandbox::image::tag_for(
+        smith_sandbox::image::BASE_TAG,
+        packages,
+        &smith_sandbox::image::digest(&worker()).unwrap(),
+        &smith_sandbox::image::digest(&smith()).unwrap(),
+    )
+}
+
+fn runroot() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/smith-runroot/{}", nix::unistd::getuid())));
+    base.join("smith/containers")
+}
+
+/// The image id and size for a package list, for the test log.
+fn image_info(supervisor: &Supervisor, packages: &[String]) -> String {
+    let output = Command::new("podman")
+        .arg("--root")
+        .arg(supervisor.store())
+        .arg("--runroot")
+        .arg(runroot())
+        .args([
+            "image",
+            "inspect",
+            &image_tag(packages),
+            "--format",
+            "{{.Id}} {{.Size}}",
+        ])
+        .output()
+        .unwrap();
+    format!(
+        "{} {}",
+        image_tag(packages),
+        String::from_utf8_lossy(&output.stdout).trim()
+    )
 }
 
 /// The provider endpoint for the in-container test. It answers every request with a canned
@@ -86,6 +126,7 @@ impl ProviderProxy for FakeProxy {
 #[ignore]
 async fn a_container_runs_a_shell_command() {
     std::env::set_var("SMITH_WORKER_BIN", worker());
+    std::env::set_var("SMITH_BIN", smith());
 
     let supervisor = Supervisor::new().unwrap();
     let workspace = std::env::temp_dir().join(format!("smith-it-{}", std::process::id()));
@@ -98,10 +139,27 @@ async fn a_container_runs_a_shell_command() {
         ro_mounts: Vec::new(),
         env: standard_env(&SandboxSettings::default()),
         idle_timeout: Duration::from_secs(30),
+        image: SandboxImageSettings::default(),
         provider: None,
     };
 
     let sandbox = supervisor.start(&config).await.unwrap();
+    eprintln!("default image: {}", image_info(&supervisor, &[]));
+
+    let inventory = sandbox.inventory();
+    for expected in ["bash", "sh", "cat", "smith"] {
+        assert!(
+            inventory.iter().any(|name| name == expected),
+            "the inventory is missing {expected}: {inventory:?}"
+        );
+    }
+    for absent in ["git", "gcc", "ld"] {
+        assert!(
+            !inventory.iter().any(|name| name == absent),
+            "the default inventory contains {absent}: {inventory:?}"
+        );
+    }
+
     let cancel = CancellationToken::new();
     let result = sandbox
         .call(
@@ -115,6 +173,17 @@ async fn a_container_runs_a_shell_command() {
 
     assert!(result.contains("\"stdout\":\"hi\""), "{result}");
     assert!(result.contains("\"exit_code\":0"), "{result}");
+
+    let clean = sandbox
+        .call(
+            "c3".to_string(),
+            "run_shell".to_string(),
+            json!({"command": "test ! -e /usr/bin/apt && test ! -e /usr/bin/dpkg && test ! -e /etc/apt && test ! -e /var/lib/dpkg && echo absent"}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(clean.contains("\"stdout\":\"absent"), "{clean}");
 
     let write = sandbox
         .call(
@@ -141,6 +210,7 @@ async fn a_container_runs_a_shell_command() {
 #[ignore]
 async fn egress_is_proxied_and_allowlisted() {
     std::env::set_var("SMITH_WORKER_BIN", worker());
+    std::env::set_var("SMITH_BIN", smith());
 
     let supervisor = Supervisor::new().unwrap();
     let workspace = std::env::temp_dir().join(format!("smith-egress-{}", std::process::id()));
@@ -161,10 +231,28 @@ async fn egress_is_proxied_and_allowlisted() {
         ro_mounts: settings.ro_mounts.clone(),
         env: standard_env(&settings),
         idle_timeout: Duration::from_secs(60),
+        image: SandboxImageSettings {
+            packages: vec!["ca-certificates".to_string(), "git".to_string()],
+        },
         provider: None,
     };
 
     let sandbox = supervisor.start(&config).await.unwrap();
+    eprintln!(
+        "git image: {}",
+        image_info(
+            &supervisor,
+            &["ca-certificates".to_string(), "git".to_string()]
+        )
+    );
+    let inventory = sandbox.inventory();
+    for expected in ["git", "perl"] {
+        assert!(
+            inventory.iter().any(|name| name == expected),
+            "the git image inventory is missing {expected}: {inventory:?}"
+        );
+    }
+
     let cancel = CancellationToken::new();
 
     let fetch = r#"mkdir -p /tmp/crate/src && cd /tmp/crate && printf '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n\n[dependencies]\nserde = "1"\n' > Cargo.toml && printf 'fn main(){}\n' > src/main.rs && cargo fetch 2>&1 | tail -3"#;
@@ -220,6 +308,7 @@ async fn a_sandboxed_child_reaches_the_host_provider_proxy() {
         ro_mounts: Vec::new(),
         env,
         idle_timeout: Duration::from_secs(60),
+        image: SandboxImageSettings::default(),
         provider: Some(Arc::new(FakeProxy {
             bodies: bodies.clone(),
         })),
@@ -261,5 +350,113 @@ async fn a_sandboxed_child_reaches_the_host_provider_proxy() {
     }
 
     sandbox.stop().await;
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// The package list that provides the compiler and linker for the mounted Rust toolchain.
+#[tokio::test]
+#[ignore]
+async fn a_toolchain_image_builds_c_and_rust() {
+    std::env::set_var("SMITH_WORKER_BIN", worker());
+    std::env::set_var("SMITH_BIN", smith());
+
+    let supervisor = Supervisor::new().unwrap();
+    let workspace = std::env::temp_dir().join(format!("smith-toolchain-{}", std::process::id()));
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let settings = SandboxSettings::default();
+    let packages = vec![
+        "gcc".to_string(),
+        "libc6-dev".to_string(),
+        "binutils".to_string(),
+    ];
+    let config = SandboxConfig {
+        workspace: workspace.clone(),
+        session: "toolchain".to_string(),
+        allow: Vec::new(),
+        ro_mounts: settings.ro_mounts.clone(),
+        env: standard_env(&settings),
+        idle_timeout: Duration::from_secs(120),
+        image: SandboxImageSettings {
+            packages: packages.clone(),
+        },
+        provider: None,
+    };
+
+    let sandbox = supervisor.start(&config).await.unwrap();
+    eprintln!("toolchain image: {}", image_info(&supervisor, &packages));
+    let cancel = CancellationToken::new();
+
+    let c = sandbox
+        .call(
+            "c1".to_string(),
+            "run_shell".to_string(),
+            json!({"command": "mkdir -p /tmp/probe && printf 'int main(void){return 0;}\n' > /tmp/probe/hello.c && gcc /tmp/probe/hello.c -o /tmp/probe/hello && /tmp/probe/hello && echo c-ok"}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(c.contains("\"stdout\":\"c-ok"), "{c}");
+
+    let rust = sandbox
+        .call(
+            "c2".to_string(),
+            "run_shell".to_string(),
+            json!({"command": "mkdir -p /tmp/rust/src && cd /tmp/rust && printf '[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n' > Cargo.toml && printf 'fn main() {}\n' > src/main.rs && cargo build --offline 2>&1 | tail -3"}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(rust.contains("\"exit_code\":0"), "{rust}");
+
+    sandbox.stop().await;
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// The same resolved packages produce one image, and a second start reuses it.
+#[tokio::test]
+#[ignore]
+async fn the_same_image_config_reuses_the_image() {
+    std::env::set_var("SMITH_WORKER_BIN", worker());
+    std::env::set_var("SMITH_BIN", smith());
+
+    let supervisor = Supervisor::new().unwrap();
+    let workspace = std::env::temp_dir().join(format!("smith-cache-{}", std::process::id()));
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let packages = vec!["ca-certificates".to_string()];
+    let settings = SandboxSettings::default();
+    let config = SandboxConfig {
+        workspace: workspace.clone(),
+        session: "cache".to_string(),
+        allow: Vec::new(),
+        ro_mounts: settings.ro_mounts.clone(),
+        env: standard_env(&settings),
+        idle_timeout: Duration::from_secs(30),
+        image: SandboxImageSettings {
+            packages: packages.clone(),
+        },
+        provider: None,
+    };
+
+    let first = supervisor.start(&config).await.unwrap();
+    let first_info = image_info(&supervisor, &packages);
+    first.stop().await;
+    let second = supervisor.start(&config).await.unwrap();
+    let second_info = image_info(&supervisor, &packages);
+    second.stop().await;
+
+    eprintln!("first:  {first_info}");
+    eprintln!("second: {second_info}");
+    assert_eq!(
+        first_info, second_info,
+        "the same package list reused the image"
+    );
+    assert_eq!(
+        image_tag(&packages),
+        image_tag(&["ca-certificates".to_string()]),
+        "the tag is deterministic"
+    );
+
     let _ = std::fs::remove_dir_all(&workspace);
 }
