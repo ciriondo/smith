@@ -109,6 +109,14 @@ pub trait Tool: Send + Sync {
     fn set_busy(&self, busy: bool) {
         let _ = busy;
     }
+
+    /// The session working directory, when this tool owns one.
+    ///
+    /// The sandbox and local tools share one value per session; the agent reads it to compose
+    /// the next provider request. Tools without a directory return `None`.
+    fn cwd(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// The line a tool contributes to the sandbox section.
@@ -146,42 +154,45 @@ pub fn specs() -> Vec<ToolSpec> {
 pub fn spec(name: &str) -> Option<ToolSpec> {
     let (description, schema) = match name {
         "read_file" => (
-            "Read a text file inside the workspace. Returns at most 2000 lines and 64 KiB per \
-             call; `truncated` reports that more remains. Binary files are rejected. Lines are \
-             1-based and the range is inclusive.",
+            "Read a text file inside the workspace. A relative path starts at the current \
+             working directory. Returns at most 2000 lines and 64 KiB per call; `truncated` \
+             reports that more remains. Binary files are rejected. Lines are 1-based and the \
+             range is inclusive.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path"],
                 "properties": {
-                    "path": {"type": "string", "description": "File to read, relative to the workspace or absolute inside it."},
+                    "path": {"type": "string", "description": "File to read, relative to the current working directory or absolute inside the workspace."},
                     "start_line": {"type": "integer", "minimum": 1, "description": "First line, 1-based."},
                     "end_line": {"type": "integer", "minimum": 1, "description": "Last line, inclusive."}
                 }
             }),
         ),
         "write_file" => (
-            "Write a text file inside the workspace, creating parent directories. The write is \
-             atomic: the previous content survives a failed write.",
+            "Write a text file inside the workspace, creating parent directories. A relative \
+             path starts at the current working directory. The write is atomic: the previous \
+             content survives a failed write.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path", "content"],
                 "properties": {
-                    "path": {"type": "string", "description": "File to write, relative to the workspace or absolute inside it."},
+                    "path": {"type": "string", "description": "File to write, relative to the current working directory or absolute inside the workspace."},
                     "content": {"type": "string", "description": "Full replacement content."}
                 }
             }),
         ),
         "edit_file" => (
-            "Replace an exact string in a text file inside the workspace. `old_string` must \
-             occur exactly once unless `replace_all` is true.",
+            "Replace an exact string in a text file inside the workspace. A relative path \
+             starts at the current working directory. `old_string` must occur exactly once \
+             unless `replace_all` is true.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path", "old_string", "new_string"],
                 "properties": {
-                    "path": {"type": "string", "description": "File to edit, relative to the workspace or absolute inside it."},
+                    "path": {"type": "string", "description": "File to edit, relative to the current working directory or absolute inside the workspace."},
                     "old_string": {"type": "string", "description": "Exact text to replace."},
                     "new_string": {"type": "string", "description": "Replacement text."},
                     "replace_all": {"type": "boolean", "description": "Replace every occurrence. Default false."}
@@ -189,18 +200,22 @@ pub fn spec(name: &str) -> Option<ToolSpec> {
             }),
         ),
         "run_shell" => (
-            "Run a command with sh -c inside the sandbox. Working directory defaults to the \
-             workspace root. Output is captured per stream and capped at 32 KiB each. The \
-             default timeout is 120 seconds and the maximum is 600. With `background: true` \
-             the call returns a task id immediately and the command runs without a timeout; \
-             use `tool_wait` to collect its output, check its status or stop it.",
+            "Run a command with sh -c inside the sandbox. The working directory defaults to the \
+             current working directory. The directory a foreground command ends in becomes the \
+             working directory for later tool calls, so `cd` persists. A background command, a \
+             command that ends by replacing the shell with `exec`, and a command stopped by the \
+             timeout do not report a new directory. Output is captured per stream and capped at \
+             32 KiB each. The default timeout is 120 seconds and the maximum is 600. With \
+             `background: true` the call returns a task id immediately and the command runs \
+             without a timeout; use `tool_wait` to collect its output, check its status or stop \
+             it.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["command"],
                 "properties": {
                     "command": {"type": "string", "description": "Shell command line."},
-                    "cwd": {"type": "string", "description": "Working directory inside the workspace."},
+                    "cwd": {"type": "string", "description": "Working directory inside the workspace, relative to the current working directory."},
                     "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds. Ignored for a background run."},
                     "background": {"type": "boolean", "description": "Start the command as a background task and return its id. Default false."}
                 }

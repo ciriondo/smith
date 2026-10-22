@@ -167,6 +167,15 @@ Core boundaries:
 - Project context and skills are host reads performed when the prompt parts are built. A
   missing or unreadable file is skipped rather than failing the session. Global skill roots
   are mounted read-only only when `prompt.skills` is enabled.
+- The sandbox and local tool handles own a `WorkingDir` per session. It starts at the
+  workspace, resolves relative file paths and the `run_shell` default directory, and stores
+  only a canonical directory inside the workspace. A foreground `run_shell` reports the
+  shell's final directory through an EXIT trap file under `/tmp`. The worker reads at most one
+  path from a regular file without following a symlink and canonicalizes it in the container;
+  the host checks every component without following a symlink.
+  A background run, a timeout or cancel, and an `exec`-replaced shell do not report.
+  `Tool::cwd` exposes the value and `run_agent` recomposes `# Sandbox` at each provider
+  request.
 - The transcript is the model-visible conversation. An assistant message keeps the reasoning
   the provider streamed with it in `Message.reasoning`, because thinking-mode models require it
   on the next request. No frontend renders the field and `Message::text()` ignores it.

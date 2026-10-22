@@ -14,6 +14,7 @@ pub mod prompt;
 pub mod provider;
 pub mod session;
 pub mod tools;
+pub mod working_dir;
 
 pub use error::{ProviderError, SmithError};
 pub use message::{ContentBlock, Message, Role, StopReason, Usage};

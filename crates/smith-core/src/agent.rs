@@ -296,9 +296,7 @@ pub async fn run_agent(
             }
         }
     }
-    request.system = context
-        .prompt
-        .compose(request.system.as_deref(), &request.model, &fragments);
+    let base_system = request.system.clone();
     request.tools = tools.iter().map(|tool| tool.spec()).collect();
 
     loop {
@@ -315,8 +313,15 @@ pub async fn run_agent(
             });
         }
 
+        let cwd = tools.iter().find_map(|tool| tool.cwd());
         let mut req = request.clone();
         req.messages = messages.clone();
+        req.system = context.prompt.compose(
+            base_system.as_deref(),
+            &request.model,
+            &fragments,
+            cwd.as_deref(),
+        );
         let mut accumulator = TurnAccumulator::new();
         let mut stream = provider.stream(req, cancel.clone());
         while let Some(item) = stream.next().await {
@@ -623,6 +628,109 @@ mod tests {
             .expect("the follow-up carries the tool call");
         assert_eq!(assistant.reasoning.as_deref(), Some("need the file"));
         assert_eq!(outcome.final_message.unwrap().text(), "done");
+    }
+
+    struct CwdTool {
+        cwd: Arc<std::sync::Mutex<std::path::PathBuf>>,
+    }
+
+    impl Tool for CwdTool {
+        fn spec(&self) -> crate::provider::ToolSpec {
+            crate::provider::ToolSpec {
+                name: "read_file".to_string(),
+                description: "changes the working directory".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call<'a>(
+            &'a self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> futures_util::future::BoxFuture<'a, Result<String, ToolError>> {
+            let next = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from);
+            if let Some(next) = next {
+                *self.cwd.lock().unwrap() = next;
+            }
+            Box::pin(async { Ok("{}".to_string()) })
+        }
+
+        fn cwd(&self) -> Option<std::path::PathBuf> {
+            Some(self.cwd.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prompt_follows_a_directory_change_inside_a_turn() {
+        let dir = std::env::temp_dir().join(format!("smith-agent-cwd-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let provider = crate::mock::MockProvider::new("mock");
+        let call_args = format!(r#"{{"path": {:?}}}"#, sub.display().to_string());
+        provider.push_events(vec![
+            delta(0, Some("c1"), Some("read_file"), &call_args),
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let cwd = Arc::new(std::sync::Mutex::new(dir.clone()));
+        let tool: Arc<dyn Tool> = Arc::new(CwdTool { cwd });
+        let mut config = crate::config::Config::default();
+        config.prompt = crate::config::PromptSettings {
+            agents_md: false,
+            skills: false,
+            tasks: false,
+            subagents: false,
+            sandbox: true,
+        };
+        let prompt = crate::prompt::PromptParts::build(
+            &config,
+            &dir,
+            &crate::prompt::PromptPaths::default(),
+            crate::prompt::SandboxFacts {
+                workspace: dir.clone(),
+                home: crate::prompt::SANDBOX_HOME.to_string(),
+                os: "Debian 13.7".to_string(),
+                shell: crate::prompt::SANDBOX_SHELL.to_string(),
+                network: "disabled".to_string(),
+            },
+        );
+        let request = ChatRequest::new("mock-1", vec![Message::user("go")], "session");
+        let outcome = run_agent(
+            &provider,
+            &[tool],
+            TurnContext {
+                workspace: &dir,
+                prompt: &prompt,
+            },
+            request,
+            PauseToken::default(),
+            CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_message.unwrap().text(), "done");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let first = requests[0].system.as_deref().unwrap();
+        assert!(
+            first.contains(&format!("- Working directory: {}", dir.display())),
+            "{first}"
+        );
+        let second = requests[1].system.as_deref().unwrap();
+        assert!(
+            second.contains(&format!("- Working directory: {}", sub.display())),
+            "{second}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

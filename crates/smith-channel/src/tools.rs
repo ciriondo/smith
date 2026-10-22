@@ -98,6 +98,13 @@ pub struct RunShellResult {
     /// True for a background start, false for a synchronous result.
     #[serde(default)]
     pub running: bool,
+    /// The session working directory after the call. A foreground shell reports the directory
+    /// it ended in; the worker and host check it before it is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Why a reported directory was rejected. The session keeps its previous directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_error: Option<String>,
 }
 
 /// Arguments of `tool_wait`.

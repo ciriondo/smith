@@ -5,8 +5,9 @@
 //! allowlist and the mounts belong to the host.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::fcntl::OFlag;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use serde::de::DeserializeOwned;
@@ -42,6 +44,8 @@ const DEFAULT_TIMEOUT_SECS: u32 = 120;
 const MAX_TIMEOUT_SECS: u32 = 600;
 const DEFAULT_WAIT_SECS: u32 = 120;
 const MAX_WAIT_SECS: u32 = 600;
+/// A directory report is one path. Anything longer is not a report.
+const CWD_REPORT_MAX_BYTES: usize = 4096;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -215,6 +219,7 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
         None => ctx.workspace.root().to_path_buf(),
     };
 
+    let start_cwd = cwd.display().to_string();
     if ctx.cancel.is_cancelled() {
         return to_json(&RunShellResult {
             exit_code: None,
@@ -225,13 +230,13 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
             cancelled: true,
             task_id: None,
             running: false,
+            cwd: Some(start_cwd),
+            cwd_error: None,
         });
     }
 
     let mut command = Command::new("/bin/sh");
     command
-        .arg("-c")
-        .arg(&args.command)
         .current_dir(&cwd)
         .env_clear()
         .envs(ctx.env)
@@ -242,7 +247,9 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
         .process_group(0);
 
     if args.background {
-        // A background run has no timeout. The model stops it with tool_wait and kill.
+        // A background run has no timeout. The model stops it with tool_wait and kill. Its
+        // final directory is not reported; a background `cd` stays in that task.
+        command.arg("-c").arg(&args.command);
         let task_id = ctx.tasks.start(command)?;
         return to_json(&RunShellResult {
             exit_code: None,
@@ -253,8 +260,26 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
             cancelled: false,
             task_id: Some(task_id),
             running: true,
+            cwd: Some(start_cwd),
+            cwd_error: None,
         });
     }
+
+    // The trap reports the shell's final physical directory. The file is untrusted: a model can
+    // write it directly, so the worker and host check the path before it is used.
+    let cwd_file = std::env::temp_dir().join(format!(
+        "smith-cwd-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let wrapped = format!(
+        "trap 'pwd -P > \"$SMITH_CWD_FILE\" 2>/dev/null' EXIT\n{}",
+        args.command
+    );
+    command
+        .arg("-c")
+        .arg(&wrapped)
+        .env("SMITH_CWD_FILE", &cwd_file);
 
     let timeout = Duration::from_secs(
         args.timeout_secs
@@ -305,6 +330,29 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
     let (stdout, out_truncated) = out_reader.join().unwrap_or_default();
     let (stderr, err_truncated) = err_reader.join().unwrap_or_default();
 
+    let mut cwd_after = start_cwd;
+    let mut cwd_error = None;
+    if !timed_out && !cancelled {
+        if let Some(text) = read_cwd_report(&cwd_file) {
+            let reported = text.trim();
+            if !reported.is_empty() {
+                match fs::canonicalize(reported) {
+                    Ok(path) if !path.starts_with(ctx.workspace.root()) => {
+                        cwd_error = Some(format!("{} is outside the workspace", path.display()));
+                    }
+                    Ok(path) if !path.is_dir() => {
+                        cwd_error = Some(format!("{} is not a directory", path.display()));
+                    }
+                    Ok(path) => cwd_after = path.display().to_string(),
+                    Err(e) => {
+                        cwd_error = Some(format!("cannot resolve the reported directory: {e}"))
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&cwd_file);
+
     to_json(&RunShellResult {
         exit_code: status.code(),
         stdout,
@@ -314,7 +362,33 @@ pub fn run_shell(args: RunShellArgs, ctx: &ToolContext<'_>) -> Result<String, St
         cancelled,
         task_id: None,
         running: false,
+        cwd: Some(cwd_after),
+        cwd_error,
     })
+}
+
+/// Read the shell's directory report.
+///
+/// The file is model-writable, so it is opened without following a symlink and without blocking
+/// on a FIFO, and at most one path is read. A non-regular file, a symlink or an oversized file
+/// yields no report.
+fn read_cwd_report(path: &Path) -> Option<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((CWD_REPORT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > CWD_REPORT_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 pub fn tool_wait(args: ToolWaitArgs, ctx: &ToolContext<'_>) -> Result<String, String> {
@@ -393,4 +467,38 @@ fn take_prefix(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    #[test]
+    fn the_directory_report_reader_ignores_unsafe_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cwd");
+        fs::write(&path, "/tmp").unwrap();
+        assert_eq!(read_cwd_report(&path).as_deref(), Some("/tmp"));
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_cwd_report(&link), None);
+
+        let fifo = dir.path().join("fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert_eq!(read_cwd_report(&fifo), None);
+
+        let big = dir.path().join("big");
+        fs::write(&big, vec![b'x'; CWD_REPORT_MAX_BYTES + 1]).unwrap();
+        assert_eq!(read_cwd_report(&big), None);
+
+        let full = dir.path().join("full");
+        fs::write(&full, vec![b'x'; CWD_REPORT_MAX_BYTES]).unwrap();
+        assert_eq!(
+            read_cwd_report(&full).map(|text| text.len()),
+            Some(CWD_REPORT_MAX_BYTES)
+        );
+    }
 }

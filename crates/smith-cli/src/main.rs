@@ -331,7 +331,18 @@ fn build_manager(
             };
             ToolSet::Factory(Arc::new(factory))
         }
-        ToolSandbox::Inherit => ToolSet::Fixed(local::local_tools(&workspace)?),
+        ToolSandbox::Inherit => {
+            // The local tools own the session working directory, so each session needs its
+            // own handle. A fixed list would share one directory across sessions.
+            let local_workspace = workspace.clone();
+            let factory = move |_: &smith_core::SessionId| {
+                local::local_tools(&local_workspace).unwrap_or_else(|e| {
+                    eprintln!("smith: local tools: {e}");
+                    Vec::new()
+                })
+            };
+            ToolSet::Factory(Arc::new(factory))
+        }
     };
 
     Ok(SessionManager::new(SessionConfig {

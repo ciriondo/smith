@@ -251,9 +251,9 @@ smith sends the base prompt followed by these sections, in order:
 2. `# Background tasks`: how a `run_shell` background task behaves and how `tool_wait`
    collects or kills it.
 3. `# Subagents`: how to run `smith -p` through `run_shell`, and when to use `background`.
-4. `# Sandbox`: working directory, home directory, operating system, command shell, model,
-   git repository root, network state, the commands the image provides and the replacements
-   worth preferring when both commands exist.
+4. `# Sandbox`: the current working directory, home directory, operating system, command
+   shell, model, git repository root, network state, the commands the image provides and the
+   replacements worth preferring when both commands exist.
 5. `# Project Context`: `$XDG_CONFIG_HOME/smith/AGENTS.md`, then `AGENTS.md` from the
    repository root down to the workspace. Each file is capped at 64 KiB and marked
    `[truncated]` when cut. The section states that it overrides the assistant defaults.
@@ -298,7 +298,16 @@ start, the turn fails and smith prints why.
   the same resolved settings reuse the image. The default list is empty.
 - A session's container stops after `[sandbox] idle_timeout` without activity, on disconnect
   and on process exit. Process state does not survive a stop; the filesystem does, through the
-  workspace and the caches.
+  workspace and the caches. The session working directory is held on the host and survives a
+  stop.
+- The working directory starts at the workspace root. A foreground `run_shell` reports the
+  directory its shell ended in, so `cd sub` persists for later tool calls, and relative paths
+  in `read_file`, `write_file` and `edit_file` start there. The directory must stay inside the
+  workspace. A background run, a run stopped by the timeout or cancel path, and a command that
+  replaces the shell with `exec` do not report a directory. The report is untrusted: the
+  worker reads at most one path from a regular file without following a symlink and
+  canonicalizes it in the container. The host checks each component without following a
+  symlink and rejects a path outside the workspace.
 - `run_shell` with `background: true` starts a long command and returns a task id. `tool_wait`
   returns the output produced since the previous wait, reports whether the task is still
   running, and can stop it. A container with an open background run is not stopped by the idle
@@ -562,7 +571,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 246 offline tests; no network, no API key needed
+cargo test                        # 263 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

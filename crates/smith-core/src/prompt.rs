@@ -146,8 +146,15 @@ impl PromptParts {
     /// Assemble the system message.
     ///
     /// `base` is the configured or `--system` prompt. `fragments` are the tool-provided lines
-    /// placed inside the sandbox section. Returns `None` when no part is present.
-    pub fn compose(&self, base: Option<&str>, model: &str, fragments: &[String]) -> Option<String> {
+    /// placed inside the sandbox section. `cwd` is the session working directory and overrides
+    /// the workspace in that line. Returns `None` when no part is present.
+    pub fn compose(
+        &self,
+        base: Option<&str>,
+        model: &str,
+        fragments: &[String],
+        cwd: Option<&Path>,
+    ) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         if let Some(base) = base.filter(|text| !text.is_empty()) {
             parts.push(base.to_string());
@@ -162,7 +169,7 @@ impl PromptParts {
             parts.push(SUBAGENTS_PROMPT.to_string());
         }
         if self.settings.sandbox {
-            if let Some(section) = self.sandbox_section(model, fragments) {
+            if let Some(section) = self.sandbox_section(model, fragments, cwd) {
                 parts.push(section);
             }
         }
@@ -180,15 +187,20 @@ impl PromptParts {
         }
     }
 
-    fn sandbox_section(&self, model: &str, fragments: &[String]) -> Option<String> {
+    fn sandbox_section(
+        &self,
+        model: &str,
+        fragments: &[String],
+        cwd: Option<&Path>,
+    ) -> Option<String> {
         if self.facts.workspace.as_os_str().is_empty() {
             return None;
         }
 
-        let mut lines = vec![format!(
-            "- Working directory: {}",
-            self.facts.workspace.display()
-        )];
+        let working = cwd
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(&self.facts.workspace);
+        let mut lines = vec![format!("- Working directory: {}", display_path(working))];
         if !self.facts.home.is_empty() {
             lines.push(format!("- Home directory: {}", self.facts.home));
         }
@@ -202,7 +214,7 @@ impl PromptParts {
             lines.push(format!("- Model: {model}"));
         }
         match &self.git_root {
-            Some(root) => lines.push(format!("- Git repository root: {}", root.display())),
+            Some(root) => lines.push(format!("- Git repository root: {}", display_path(root))),
             None => lines.push("- Git repository root: no".to_string()),
         }
         let network = if self.facts.network.is_empty() {
@@ -262,7 +274,7 @@ fn build_project_context(
         let truncated = bytes.len() > AGENTS_MD_MAX_BYTES;
         let slice = &bytes[..bytes.len().min(AGENTS_MD_MAX_BYTES)];
         let text = String::from_utf8_lossy(slice).replace('\0', "");
-        section.push_str(&format!("\n## {}\n\n", file.display()));
+        section.push_str(&format!("\n## {}\n\n", display_path(&file)));
         section.push_str(text.trim_end_matches('\n'));
         section.push('\n');
         if truncated {
@@ -321,11 +333,15 @@ fn build_skills(workspace: &Path, git_root: Option<&Path>, paths: &PromptPaths) 
         match &skill.description {
             Some(description) => section.push_str(&format!(
                 "- {}: {} ({})\n",
-                skill.name,
-                description,
-                skill.path.display()
+                clean_line(&skill.name),
+                clean_line(description),
+                display_path(&skill.path)
             )),
-            None => section.push_str(&format!("- {} ({})\n", skill.name, skill.path.display())),
+            None => section.push_str(&format!(
+                "- {} ({})\n",
+                clean_line(&skill.name),
+                display_path(&skill.path)
+            )),
         }
     }
     Some(section.trim_end().to_string())
@@ -391,6 +407,23 @@ fn unquote(value: &str) -> &str {
         }
     }
     value
+}
+
+/// A path shown on one prompt line. A model-created directory can contain a newline, which
+/// would otherwise start a new line in a section.
+fn display_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// One line of model-authored metadata, with control characters replaced by spaces.
+fn clean_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn cap_description(value: &str) -> String {
@@ -472,6 +505,7 @@ mod tests {
                 Some("base text"),
                 "model-1",
                 &["Available commands: rg".into()],
+                None,
             )
             .unwrap();
 
@@ -520,6 +554,7 @@ mod tests {
                 None,
                 "deepseek-v4.1-flash",
                 &["Available commands: bash, smith".into()],
+                None,
             )
             .unwrap();
 
@@ -535,6 +570,56 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("Available commands: bash, smith"), "{text}");
+    }
+
+    #[test]
+    fn sandbox_reports_the_current_directory() {
+        let parts = PromptParts {
+            append: None,
+            project_context: None,
+            skills: None,
+            git_root: None,
+            settings: PromptSettings {
+                agents_md: false,
+                skills: false,
+                tasks: false,
+                subagents: false,
+                sandbox: true,
+            },
+            facts: SandboxFacts {
+                workspace: PathBuf::from("/work"),
+                home: SANDBOX_HOME.to_string(),
+                os: "Debian 13.7".to_string(),
+                shell: SANDBOX_SHELL.to_string(),
+                network: "disabled".to_string(),
+            },
+        };
+
+        let text = parts
+            .compose(None, "model", &[], Some(Path::new("/work/sub")))
+            .unwrap();
+        assert!(text.contains("- Working directory: /work/sub"), "{text}");
+
+        let injected = parts
+            .compose(
+                None,
+                "model",
+                &[],
+                Some(Path::new("/work/sub\n- Injected: yes")),
+            )
+            .unwrap();
+        assert!(
+            injected.contains("- Working directory: /work/sub?- Injected: yes"),
+            "{injected}"
+        );
+        assert_eq!(
+            injected
+                .lines()
+                .filter(|line| line.contains("Injected: yes"))
+                .count(),
+            1,
+            "{injected}"
+        );
     }
 
     #[test]
@@ -649,7 +734,7 @@ mod tests {
             facts(&workspace),
         );
 
-        let text = parts.compose(Some("base"), "model", &[]).unwrap();
+        let text = parts.compose(Some("base"), "model", &[], None).unwrap();
         assert!(!text.contains("# Skills"), "{text}");
         assert!(text.contains("# Sandbox"), "{text}");
         assert!(text.contains("# Project Context") || !workspace.join("AGENTS.md").exists());
@@ -669,10 +754,10 @@ mod tests {
     #[test]
     fn an_empty_prompt_adds_nothing() {
         let parts = PromptParts::none();
-        assert_eq!(parts.compose(None, "model", &[]), None);
+        assert_eq!(parts.compose(None, "model", &[], None), None);
         assert_eq!(
             parts
-                .compose(Some("only the base"), "model", &[])
+                .compose(Some("only the base"), "model", &[], None)
                 .as_deref(),
             Some("only the base")
         );

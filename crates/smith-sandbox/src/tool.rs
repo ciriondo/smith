@@ -13,6 +13,7 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use smith_core::config::SandboxSettings;
 use smith_core::tools::{spec, TOOL_NAMES};
+use smith_core::working_dir::WorkingDir;
 use smith_core::{Tool, ToolContext, ToolError, ToolSpec};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -28,10 +29,13 @@ pub struct Handle {
     next_call: AtomicU64,
     /// Task ids whose background run has not reported completion through `tool_wait`.
     open_tasks: Mutex<BTreeSet<String>>,
+    /// The session working directory shared by every tool.
+    working: WorkingDir,
 }
 
 /// Build the five tools. The container starts lazily, on the first call.
 pub fn sandbox_tools(supervisor: Arc<Supervisor>, config: SandboxConfig) -> Vec<Arc<dyn Tool>> {
+    let working = WorkingDir::new(config.workspace.clone());
     let handle = Arc::new(Handle {
         supervisor,
         config,
@@ -40,6 +44,7 @@ pub fn sandbox_tools(supervisor: Arc<Supervisor>, config: SandboxConfig) -> Vec<
         last_used: Mutex::new(Instant::now()),
         next_call: AtomicU64::new(1),
         open_tasks: Mutex::new(BTreeSet::new()),
+        working,
     });
     spawn_idle_monitor(&handle);
 
@@ -94,10 +99,13 @@ impl Handle {
     ) -> Result<String, ToolError> {
         let sandbox = self.ensure().await?;
         self.touch();
+        let mut args = args;
+        self.working.rewrite(name, &mut args);
         let call_id = format!("c{}", self.next_call.fetch_add(1, Ordering::SeqCst));
         let result = sandbox
             .call(call_id, name.to_string(), args, &ctx.cancel)
             .await;
+        let result = result.map(|content| self.working.observe(name, content));
         if let Ok(content) = &result {
             update_open_tasks(&self.open_tasks, name, content);
         }
@@ -186,6 +194,10 @@ impl Tool for SandboxTool {
         if busy {
             self.handle.touch();
         }
+    }
+
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        Some(self.handle.working.current())
     }
 }
 

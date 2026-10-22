@@ -148,6 +148,8 @@ fn results_round_trip_through_json() {
         cancelled: false,
         task_id: None,
         running: false,
+        cwd: None,
+        cwd_error: None,
     };
     let value = serde_json::to_value(&shell).unwrap();
     assert!(value["exit_code"].is_null());

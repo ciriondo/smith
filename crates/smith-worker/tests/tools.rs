@@ -289,6 +289,96 @@ fn run_shell_honours_cwd() {
         printed.ends_with("/sub"),
         "expected the sub directory, got {printed}"
     );
+    assert!(result.cwd.unwrap().ends_with("/sub"));
+}
+
+#[test]
+fn run_shell_reports_the_final_directory() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.dir.path().join("sub")).unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "cd sub"})).unwrap()
+    });
+    assert_eq!(result.exit_code, Some(0));
+    let cwd = result.cwd.expect("a reported directory");
+    assert!(cwd.ends_with("/sub"), "{cwd}");
+    assert!(result.cwd_error.is_none());
+
+    let next = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "pwd", "cwd": cwd})).unwrap()
+    });
+    assert!(next.stdout.trim_end().ends_with("/sub"));
+}
+
+#[test]
+fn a_subshell_cd_does_not_change_the_directory() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.dir.path().join("sub")).unwrap();
+    let root = fixture.dir.path().canonicalize().unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "( cd /tmp; true )"})).unwrap()
+    });
+    assert_eq!(
+        result.cwd.as_deref(),
+        Some(root.display().to_string().as_str())
+    );
+    assert!(result.cwd_error.is_none());
+}
+
+#[test]
+fn a_failed_command_still_reports_the_directory() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.dir.path().join("sub")).unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "cd sub; false"})).unwrap()
+    });
+    assert_eq!(result.exit_code, Some(1));
+    assert!(result.cwd.unwrap().ends_with("/sub"));
+}
+
+#[test]
+fn exec_loses_the_reported_directory() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.dir.path().join("sub")).unwrap();
+    let root = fixture.dir.path().canonicalize().unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "cd sub; exec /bin/true"})).unwrap()
+    });
+    assert_eq!(
+        result.cwd.as_deref(),
+        Some(root.display().to_string().as_str())
+    );
+    assert!(result.cwd_error.is_none());
+}
+
+#[test]
+fn a_directory_outside_the_workspace_is_rejected() {
+    let fixture = fixture();
+    let root = fixture.dir.path().canonicalize().unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "cd /tmp"})).unwrap()
+    });
+    assert_eq!(
+        result.cwd.as_deref(),
+        Some(root.display().to_string().as_str())
+    );
+    assert!(result.cwd_error.unwrap().contains("outside"));
+}
+
+#[test]
+fn a_background_run_does_not_change_the_directory() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.dir.path().join("sub")).unwrap();
+    let root = fixture.dir.path().canonicalize().unwrap();
+    let result = with_ctx(&fixture, |ctx| {
+        shell_result(ctx, json!({"command": "cd sub", "background": true})).unwrap()
+    });
+    assert!(result.running);
+    assert_eq!(
+        result.cwd.as_deref(),
+        Some(root.display().to_string().as_str())
+    );
+    assert!(result.cwd_error.is_none());
 }
 
 #[test]
@@ -315,6 +405,15 @@ fn run_shell_times_out_and_kills_the_group() {
     assert!(result.timed_out);
     assert!(!result.cancelled);
     assert_eq!(result.exit_code, None);
+    assert!(result.cwd.unwrap().ends_with(
+        fixture
+            .dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    ));
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 

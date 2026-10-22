@@ -11,6 +11,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use smith_core::tools::{spec, TOOL_NAMES};
+use smith_core::working_dir::WorkingDir;
 use smith_core::{SmithError, Tool, ToolContext, ToolError, ToolSpec};
 use smith_worker::protocol::{read_inventory, INVENTORY_PATH};
 use smith_worker::tools::{execute, ToolContext as WorkerContext};
@@ -22,6 +23,7 @@ struct Handle {
     env: BTreeMap<String, String>,
     tasks: Arc<TaskRegistry>,
     inventory: Option<String>,
+    working: WorkingDir,
 }
 
 /// The five tools that execute in the current environment.
@@ -29,6 +31,7 @@ pub fn local_tools(workspace: &Path) -> Result<Vec<Arc<dyn Tool>>, SmithError> {
     let workspace = Workspace::new(workspace).map_err(SmithError::Config)?;
     let env = std::env::vars().collect();
     let handle = Arc::new(Handle {
+        working: WorkingDir::new(workspace.root().to_path_buf()),
         workspace,
         env,
         tasks: Arc::new(TaskRegistry::new()),
@@ -65,6 +68,10 @@ impl Tool for LocalTool {
         Box::pin(async move { Ok(self.handle.inventory.clone()) })
     }
 
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        Some(self.handle.working.current())
+    }
+
     fn call<'a>(
         &'a self,
         args: Value,
@@ -83,6 +90,10 @@ impl Tool for LocalTool {
                 })
             };
 
+            let mut args = args;
+            handle.working.rewrite(&name, &mut args);
+            let result_handle = handle.clone();
+            let result_name = name.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let worker = WorkerContext {
                     workspace: &handle.workspace,
@@ -96,7 +107,7 @@ impl Tool for LocalTool {
             bridge.abort();
 
             match result {
-                Ok(Ok(content)) => Ok(content),
+                Ok(Ok(content)) => Ok(result_handle.working.observe(&result_name, content)),
                 Ok(Err(message)) => Err(ToolError::Message(message)),
                 Err(e) => Err(ToolError::Message(format!(
                     "the local tool task failed: {e}"
@@ -153,6 +164,63 @@ mod tests {
         assert_eq!(shell["stdout"], "local");
         assert_eq!(shell["stderr"], "");
         assert_eq!(shell["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_shell_cd_persists_for_later_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.txt"), "hello\n").unwrap();
+        let tools = local_tools(dir.path()).unwrap();
+
+        let result = call(
+            &tools,
+            dir.path(),
+            "run_shell",
+            json!({"command": "cd sub"}),
+        )
+        .await
+        .unwrap();
+        let cwd = result["cwd"].as_str().expect("a reported directory");
+        assert!(cwd.ends_with("/sub"), "{cwd}");
+
+        let pwd = call(&tools, dir.path(), "run_shell", json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert!(
+            pwd["stdout"].as_str().unwrap().trim_end().ends_with("/sub"),
+            "{pwd}"
+        );
+
+        let read = call(&tools, dir.path(), "read_file", json!({"path": "a.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(read["content"], "hello\n");
+    }
+
+    #[tokio::test]
+    async fn separate_tool_sets_keep_separate_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let first = local_tools(dir.path()).unwrap();
+        let second = local_tools(dir.path()).unwrap();
+
+        call(
+            &first,
+            dir.path(),
+            "run_shell",
+            json!({"command": "cd sub"}),
+        )
+        .await
+        .unwrap();
+
+        let pwd = call(&second, dir.path(), "run_shell", json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            pwd["stdout"].as_str().unwrap().trim_end(),
+            dir.path().canonicalize().unwrap().display().to_string()
+        );
     }
 
     #[tokio::test]
