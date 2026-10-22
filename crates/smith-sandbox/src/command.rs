@@ -88,6 +88,28 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_mount_covers_a_file_and_a_directory() {
+        let mounts = [
+            PathBuf::from("/home/chris/projects/smith/AGENTS.md"),
+            PathBuf::from("/home/chris/projects/smith/.agents"),
+        ];
+        let spec = ContainerSpec {
+            workspace: Path::new("/home/chris/projects/smith"),
+            session: "s1",
+            cidfile: Path::new("/tmp/cid"),
+            ro_mounts: &mounts,
+            image: "smith-sandbox:0.1.0",
+            worker: Path::new("/usr/local/bin/smith-worker"),
+            version: "0.1.0",
+        };
+        let args = run_args(&spec, Path::new("/home/chris/.local/share/smith/cache"));
+        for path in mounts {
+            let pair = format!("{}:{}:ro", path.display(), path.display());
+            assert!(args.iter().any(|arg| arg == &pair), "{pair} is missing");
+        }
+    }
+
+    #[test]
     fn every_security_flag_is_present() {
         let args = run_args(&spec(), Path::new("/home/chris/.local/share/smith/cache"));
         for flag in [

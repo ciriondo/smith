@@ -22,6 +22,7 @@ use smith_core::prompt::{PromptParts, PromptPaths, SandboxFacts, SANDBOX_HOME, S
 use smith_core::session::{
     SessionConfig, SessionHandle, SessionManager, SubError, Subscription, ToolSet,
 };
+use smith_core::skills::ReadSkillTool;
 use smith_core::{SmithError, ToolDisplay, UiEventKind};
 use theme::{Role, Theme};
 
@@ -254,6 +255,17 @@ fn network_summary(allow: &[NetworkEntry]) -> String {
     format!("allowlist: {}", entries.join(", "))
 }
 
+/// Existing project guidance paths that the sandbox mounts read-only.
+///
+/// The paths are the workspace root only. `AGENTS.md` and `.agents` above the workspace are
+/// host files outside the mount; the prompt reads them on the host.
+fn project_guidance_mounts(workspace: &std::path::Path) -> Vec<PathBuf> {
+    [workspace.join("AGENTS.md"), workspace.join(".agents")]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
 /// Resolve the provider, model and system prompt into a `SessionManager`.
 fn build_manager(
     config: &Config,
@@ -281,6 +293,11 @@ fn build_manager(
             }
         }
     }
+    for guidance in project_guidance_mounts(&workspace) {
+        if !settings.ro_mounts.contains(&guidance) {
+            settings.ro_mounts.push(guidance);
+        }
+    }
     let facts = SandboxFacts {
         workspace: workspace.clone(),
         home: SANDBOX_HOME.to_string(),
@@ -289,6 +306,7 @@ fn build_manager(
         network: network_summary(&settings.allow),
     };
     let prompt = PromptParts::build(config, &workspace, &paths, facts);
+    let skill_catalog = prompt.skill_catalog();
 
     let tools = match tool_sandbox {
         ToolSandbox::Container => {
@@ -299,6 +317,7 @@ fn build_manager(
             let provider_id = model.provider.clone();
             let provider_cfg = provider_cfg.clone();
             let model_id = model.model.clone();
+            let catalog = skill_catalog.clone();
             let factory = move |id: &smith_core::SessionId| {
                 // The child's provider is the host proxy for this session. A failure here
                 // leaves the sandbox without a provider, which the child reports as a 502.
@@ -327,7 +346,11 @@ fn build_manager(
                     image: settings.image.clone(),
                     provider: proxy,
                 };
-                smith_sandbox::sandbox_tools(supervisor.clone(), sandbox)
+                let mut tools = smith_sandbox::sandbox_tools(supervisor.clone(), sandbox);
+                if !catalog.is_empty() {
+                    tools.push(Arc::new(ReadSkillTool::new(catalog.clone())));
+                }
+                tools
             };
             ToolSet::Factory(Arc::new(factory))
         }
@@ -335,11 +358,16 @@ fn build_manager(
             // The local tools own the session working directory, so each session needs its
             // own handle. A fixed list would share one directory across sessions.
             let local_workspace = workspace.clone();
+            let catalog = skill_catalog.clone();
             let factory = move |_: &smith_core::SessionId| {
-                local::local_tools(&local_workspace).unwrap_or_else(|e| {
+                let mut tools = local::local_tools(&local_workspace).unwrap_or_else(|e| {
                     eprintln!("smith: local tools: {e}");
                     Vec::new()
-                })
+                });
+                if !catalog.is_empty() {
+                    tools.push(Arc::new(ReadSkillTool::new(catalog.clone())));
+                }
+                tools
             };
             ToolSet::Factory(Arc::new(factory))
         }
@@ -989,6 +1017,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("SMITH_IN_SANDBOX"), "{error}");
+    }
+
+    #[test]
+    fn existing_project_guidance_is_mounted_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(project_guidance_mounts(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::create_dir(dir.path().join(".agents")).unwrap();
+        let mounts = project_guidance_mounts(dir.path());
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.contains(&dir.path().join("AGENTS.md")));
+        assert!(mounts.contains(&dir.path().join(".agents")));
     }
 
     fn session_running(provider: Arc<MockProvider>) -> SessionHandle {

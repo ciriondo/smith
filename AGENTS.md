@@ -165,8 +165,10 @@ Core boundaries:
   The order is base, append, background tasks, subagents, sandbox, project context, skills.
   Frontends do not compose prompts.
 - Project context and skills are host reads performed when the prompt parts are built. A
-  missing or unreadable file is skipped rather than failing the session. Global skill roots
-  are mounted read-only only when `prompt.skills` is enabled.
+  missing or unreadable file is skipped rather than failing the session. The project
+  `AGENTS.md` and `.agents` paths are mounted read-only in the sandbox when they exist; the
+  global skill roots are mounted read-only when `prompt.skills` is enabled. `read_skill`
+  resolves a listed skill name, never a path.
 - The sandbox and local tool handles own a `WorkingDir` per session. It starts at the
   workspace, resolves relative file paths and the `run_shell` default directory, and stores
   only a canonical directory inside the workspace. A foreground `run_shell` reports the

@@ -13,7 +13,7 @@ network interface, a read-only root filesystem and explicit mounts.
 
 | | |
 |---|---|
-| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file`, `run_shell` and background `tool_wait` in a sandbox, and sandboxed `smith -p` subagents whose provider calls are proxied by the host |
+| **Works** | Streaming replies, multi-turn conversations, headless one-shot mode, provider registry, config, `smith serve` (localhost-only browser UI over the same sessions), `read_file`, `write_file`, `edit_file`, `read_skill`, `run_shell` and background `tool_wait` in a sandbox, and sandboxed `smith -p` subagents whose provider calls are proxied by the host |
 | **Not yet** | Session persistence across restarts; resource limits; the vendored podman fallback |
 | **Milestones** | M0/M1 (core, CLI), M2 (tools and sandbox) and M4 (web) done |
 
@@ -259,10 +259,12 @@ smith sends the base prompt followed by these sections, in order:
    `[truncated]` when cut. The section states that it overrides the assistant defaults.
 6. `# Skills`: `SKILL.md` descriptions from project `.agents/skills` directories, then
    `$XDG_CONFIG_HOME/smith/skills` and `~/.agents/skills`. The listing gives the name,
-   description and path; the model reads the body with `read_file`.
+   description and path; `read_skill` reads the body by name.
 
-The skills roots outside the workspace are mounted read-only when the skills section is
-enabled, so the listed paths are readable inside the sandbox. Empty sections are omitted. The
+The project `AGENTS.md` and `.agents` directory are mounted read-only inside the sandbox when
+they exist; a write, edit or rename of either path fails. The global skill roots are mounted
+read-only when the skills section is enabled. `read_skill` resolves a listed name and never a
+path. Empty sections are omitted. The
 `[prompt]` table and the order are described under configuration.
 
 ## Sandbox
@@ -283,8 +285,9 @@ start, the turn fails and smith prints why.
   `/etc/smith/config.toml` defines the `sandbox` provider.
 - The root filesystem is read-only, `/tmp` is a tmpfs, the workspace is mounted at its own
   path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`. Existing
-  `$XDG_CONFIG_HOME/smith/skills` and `~/.agents/skills` directories are mounted read-only at
-  their own paths when `prompt.skills` is enabled.
+  `$XDG_CONFIG_HOME/smith/skills` and `~/.agents/skills` directories and the project
+  `AGENTS.md` and `.agents` are mounted read-only at their own paths. The project files are
+  mounted even when their prompt sections are disabled.
 - The environment is computed rather than inherited. Values travel over the channel and never
   appear in the container's command line.
 - The base image ships inside the `smith` binary as a compressed docker archive and is loaded
@@ -308,6 +311,11 @@ start, the turn fails and smith prints why.
   worker reads at most one path from a regular file without following a symlink and
   canonicalizes it in the container. The host checks each component without following a
   symlink and rejects a path outside the workspace.
+- The project-level `AGENTS.md` and `.agents` directory are read-only inside the sandbox. The
+  repository carries an empty `.agents` directory so that path exists and is mounted; add
+  skills under `.agents/skills`. The prompt still reads the host copies on the host. The model
+  can create `AGENTS.md` or `.agents` in a subdirectory; the prompt does not read descendants of
+  the workspace, and a `smith -p` child started there is model-controlled.
 - `run_shell` with `background: true` starts a long command and returns a task id. `tool_wait`
   returns the output produced since the previous wait, reports whether the task is still
   running, and can stop it. A container with an open background run is not stopped by the idle
@@ -408,7 +416,7 @@ Every top-level key is optional:
 | `system_prompt` | Replaces the built-in base prompt for every session |
 | `system_prompt_append` | Appended after the base prompt and before the procedural sections |
 | `prompt.agents_md` | Include `# Project Context`. Default `true` |
-| `prompt.skills` | Include `# Skills` and mount the global skill roots. Default `true` |
+| `prompt.skills` | Include `# Skills` and mount the skill roots. Default `true` |
 | `prompt.tasks` | Include `# Background tasks`. Default `true` |
 | `prompt.subagents` | Include `# Subagents`. Default `true` |
 | `prompt.sandbox` | Include `# Sandbox`. Default `true` |
@@ -571,7 +579,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 263 offline tests; no network, no API key needed
+cargo test                        # 268 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

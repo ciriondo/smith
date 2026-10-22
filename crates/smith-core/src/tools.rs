@@ -145,9 +145,13 @@ pub fn inventory_sentence(inventory: &[String]) -> Option<String> {
     Some(sentence)
 }
 
-/// The specs of all five tools, in a stable order.
+/// The specs of the five worker tools plus the host-side `read_skill`.
 pub fn specs() -> Vec<ToolSpec> {
-    TOOL_NAMES.iter().filter_map(|name| spec(name)).collect()
+    let mut specs: Vec<ToolSpec> = TOOL_NAMES.iter().filter_map(|name| spec(name)).collect();
+    if let Some(skill) = spec("read_skill") {
+        specs.push(skill);
+    }
+    specs
 }
 
 /// The spec of one tool.
@@ -218,6 +222,18 @@ pub fn spec(name: &str) -> Option<ToolSpec> {
                     "cwd": {"type": "string", "description": "Working directory inside the workspace, relative to the current working directory."},
                     "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds. Ignored for a background run."},
                     "background": {"type": "boolean", "description": "Start the command as a background task and return its id. Default false."}
+                }
+            }),
+        ),
+        "read_skill" => (
+            "Read the body of a skill listed in the system prompt. The name must match one of \
+             the listed skills; a path cannot be supplied.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string", "description": "Name of a skill listed in the system prompt."}
                 }
             }),
         ),
@@ -426,6 +442,7 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
         .get("path")
         .or_else(|| args.get("command"))
         .or_else(|| args.get("id"))
+        .or_else(|| args.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let first_line = target.lines().next().unwrap_or("");
@@ -513,9 +530,11 @@ mod tests {
             assert_eq!(spec.schema["additionalProperties"], false);
             assert!(!spec.description.is_empty());
         }
-        assert_eq!(specs().len(), TOOL_NAMES.len());
+        assert_eq!(specs().len(), TOOL_NAMES.len() + 1);
         assert!(spec("rm_rf").is_none());
 
+        let skill = spec("read_skill").expect("read_skill");
+        assert_eq!(skill.schema["required"], json!(["name"]));
         let wait = spec("tool_wait").expect("tool_wait");
         assert_eq!(wait.schema["required"], json!(["id"]));
         let shell = spec("run_shell").expect("run_shell");
@@ -696,6 +715,10 @@ mod tests {
         assert_eq!(
             summarize_call("run_shell", &json!({"command": "cargo test\n--all"})),
             "run_shell cargo test"
+        );
+        assert_eq!(
+            summarize_call("read_skill", &json!({"name": "deploy"})),
+            "read_skill deploy"
         );
         assert_eq!(
             summarize_call("read_file", &Value::Null),

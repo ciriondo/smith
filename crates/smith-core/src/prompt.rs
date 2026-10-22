@@ -11,8 +11,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::{Config, PromptSettings};
+use crate::skills::{SkillCatalog, SkillEntry};
 
 /// The most bytes taken from one `AGENTS.md`.
 pub const AGENTS_MD_MAX_BYTES: usize = 64 * 1024;
@@ -87,6 +89,7 @@ pub struct PromptParts {
     append: Option<String>,
     project_context: Option<String>,
     skills: Option<String>,
+    skill_catalog: Arc<SkillCatalog>,
     git_root: Option<PathBuf>,
     settings: PromptSettings,
     facts: SandboxFacts,
@@ -99,6 +102,7 @@ impl PromptParts {
             append: None,
             project_context: None,
             skills: None,
+            skill_catalog: Arc::new(SkillCatalog::default()),
             git_root: None,
             settings: PromptSettings {
                 agents_md: false,
@@ -128,19 +132,25 @@ impl PromptParts {
         } else {
             None
         };
-        let skills = if config.prompt.skills {
+        let (skills, skill_catalog) = if config.prompt.skills {
             build_skills(workspace, git_root.as_deref(), paths)
         } else {
-            None
+            (None, SkillCatalog::default())
         };
         Self {
             append: config.system_prompt_append.clone(),
             project_context,
             skills,
+            skill_catalog: Arc::new(skill_catalog),
             git_root,
             settings: config.prompt.clone(),
             facts,
         }
+    }
+
+    /// The skills listed by this prompt. The `read_skill` tool uses the same catalog.
+    pub fn skill_catalog(&self) -> Arc<SkillCatalog> {
+        self.skill_catalog.clone()
     }
 
     /// Assemble the system message.
@@ -289,14 +299,18 @@ fn build_project_context(
     }
 }
 
-fn build_skills(workspace: &Path, git_root: Option<&Path>, paths: &PromptPaths) -> Option<String> {
+fn build_skills(
+    workspace: &Path,
+    git_root: Option<&Path>,
+    paths: &PromptPaths,
+) -> (Option<String>, SkillCatalog) {
     let mut roots = Vec::new();
     for dir in project_dirs(workspace, git_root) {
         roots.push(dir.join(".agents").join("skills"));
     }
     roots.extend(global_skill_roots(paths));
 
-    let mut skills: Vec<Skill> = Vec::new();
+    let mut skills: Vec<SkillEntry> = Vec::new();
     for root in roots {
         let Ok(entries) = fs::read_dir(&root) else {
             continue;
@@ -312,7 +326,7 @@ fn build_skills(workspace: &Path, git_root: Option<&Path>, paths: &PromptPaths) 
             let Ok(bytes) = fs::read(&path) else {
                 continue;
             };
-            skills.push(Skill {
+            skills.push(SkillEntry {
                 name,
                 description: skill_description(&bytes),
                 path,
@@ -321,14 +335,13 @@ fn build_skills(workspace: &Path, git_root: Option<&Path>, paths: &PromptPaths) 
     }
 
     if skills.is_empty() {
-        return None;
+        return (None, SkillCatalog::default());
     }
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    let catalog = SkillCatalog::new(skills);
 
-    let mut section = String::from(
-        "# Skills\n\nRead the corresponding SKILL.md when a task matches the description:\n",
-    );
-    for skill in skills {
+    let mut section =
+        String::from("# Skills\n\nUse `read_skill` with the listed name to read a skill:\n");
+    for skill in catalog.entries() {
         section.push('\n');
         match &skill.description {
             Some(description) => section.push_str(&format!(
@@ -344,7 +357,7 @@ fn build_skills(workspace: &Path, git_root: Option<&Path>, paths: &PromptPaths) 
             )),
         }
     }
-    Some(section.trim_end().to_string())
+    (Some(section.trim_end().to_string()), catalog)
 }
 
 /// The directories whose `AGENTS.md` files are injected, root first.
@@ -365,12 +378,6 @@ fn project_dirs(workspace: &Path, git_root: Option<&Path>) -> Vec<PathBuf> {
         }
     }
     dirs
-}
-
-struct Skill {
-    name: String,
-    description: Option<String>,
-    path: PathBuf,
 }
 
 /// Read the `description` scalar from the skill's YAML frontmatter.
@@ -495,6 +502,7 @@ mod tests {
             append: Some("append text".to_string()),
             project_context: Some("# Project Context\n\nproject".to_string()),
             skills: Some("# Skills\n\n- a (x)".to_string()),
+            skill_catalog: Arc::new(SkillCatalog::default()),
             git_root: Some(dir.path().join("root")),
             settings: PromptSettings::default(),
             facts: facts(dir.path()),
@@ -532,6 +540,7 @@ mod tests {
             append: None,
             project_context: None,
             skills: None,
+            skill_catalog: Arc::new(SkillCatalog::default()),
             git_root: None,
             settings: PromptSettings {
                 agents_md: false,
@@ -578,6 +587,7 @@ mod tests {
             append: None,
             project_context: None,
             skills: None,
+            skill_catalog: Arc::new(SkillCatalog::default()),
             git_root: None,
             settings: PromptSettings {
                 agents_md: false,
@@ -702,7 +712,17 @@ mod tests {
             "---\ndescription: third skill\n---\nbody\n",
         );
 
-        let section = build_skills(&workspace, None, &paths).unwrap();
+        let (section, catalog) = build_skills(&workspace, None, &paths);
+        let section = section.unwrap();
+        assert_eq!(
+            catalog
+                .entries()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert!(section.contains("`read_skill`"), "{section}");
         let alpha = section.find("- alpha (").unwrap();
         let beta = section.find("- beta: second skill (").unwrap();
         let gamma = section.find("- gamma: third skill (").unwrap();
