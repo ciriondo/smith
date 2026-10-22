@@ -159,6 +159,14 @@ Core boundaries:
 - The session actor owns the only mutable conversation state. Frontends hold `SessionHandle`
   clones. Do not add global mutable state. Spawned tasks must not outlive the session they
   serve.
+- The system message is composed in `smith-core/src/prompt.rs` from the base prompt in
+  `ChatRequest.system`, `system_prompt_append`, the static sections, and the fragment a tool
+  returns from `prepare`. `run_agent` composes it; the session builds the static parts once.
+  The order is base, append, background tasks, subagents, sandbox, project context, skills.
+  Frontends do not compose prompts.
+- Project context and skills are host reads performed when the prompt parts are built. A
+  missing or unreadable file is skipped rather than failing the session. Global skill roots
+  are mounted read-only only when `prompt.skills` is enabled.
 - The transcript is the model-visible conversation. An assistant message keeps the reasoning
   the provider streamed with it in `Message.reasoning`, because thinking-mode models require it
   on the next request. No frontend renders the field and `Message::text()` ignores it.
@@ -224,6 +232,8 @@ are ignored; they need podman, the built binaries and network.
   that sets `SMITH_*` must take a shared lock and restore the previous value, as
   `env_overrides_model` does. Prefer passing a path or value explicitly. The suite must pass
   with no `SMITH_*` variables and no API key set.
+- Prompt tests build temporary global and project directories and pass them as `PromptPaths`.
+  They do not read the real config home or the workspace's `AGENTS.md`.
 
 Where a test goes:
 

@@ -83,15 +83,7 @@ impl Handle {
     async fn prepare_impl(&self) -> Result<Option<String>, ToolError> {
         let sandbox = self.ensure().await?;
         self.touch();
-        let inventory = sandbox.inventory();
-        if inventory.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(format!(
-                "The sandbox image provides: {}.",
-                inventory.join(", ")
-            )))
-        }
+        Ok(smith_core::tools::inventory_sentence(sandbox.inventory()))
     }
 
     async fn call_impl(

@@ -79,12 +79,8 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "action is destructive or affects shared state, or you need a value you can't obtain. To ask, ",
     "end your turn with one targeted question and a recommended default.\n",
     "\n",
-    "Prefer read/edit/write for ordinary file operations. Bash remains useful for searches, ",
-    "pipelines, formatters, and bulk transformations.\n",
-    "\n",
-    "To delegate work, run `smith -p \"<task>\"` with `run_shell`. The child runs in this sandbox ",
-    "with the same workspace and tools, and the host proxies its provider calls, so it needs no ",
-    "key. Its final answer is the command's stdout.\n",
+    "Prefer `read_file`, `edit_file` and `write_file` for ordinary file operations. Bash ",
+    "remains useful for searches, pipelines, formatters, and bulk transformations.\n",
     "\n",
     "When changing code:\n",
     "- Make the smallest correct change that fits the existing style.\n",
@@ -148,6 +144,31 @@ impl Default for UiSettings {
     }
 }
 
+/// Which procedural sections the system prompt carries.
+///
+/// A disabled section is omitted without changing the base prompt. The base prompt itself is
+/// replaced by `system_prompt` or `--system`; this table only controls what is appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptSettings {
+    pub agents_md: bool,
+    pub skills: bool,
+    pub tasks: bool,
+    pub subagents: bool,
+    pub sandbox: bool,
+}
+
+impl Default for PromptSettings {
+    fn default() -> Self {
+        Self {
+            agents_md: true,
+            skills: true,
+            tasks: true,
+            subagents: true,
+            sandbox: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Provider used when a model is addressed without a `provider/` prefix.
@@ -156,6 +177,10 @@ pub struct Config {
     pub model: String,
     /// System prompt for every session. Defaults to [`DEFAULT_SYSTEM_PROMPT`].
     pub system_prompt: Option<String>,
+    /// Text appended after the base prompt and before the procedural sections.
+    pub system_prompt_append: Option<String>,
+    /// The procedural sections appended after the base prompt.
+    pub prompt: PromptSettings,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub serve: ServeConfig,
@@ -219,6 +244,8 @@ impl Default for Config {
             default_provider: "opencode-go".to_string(),
             model: "opencode-go/glm-5.3-flash".to_string(),
             system_prompt: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
+            system_prompt_append: None,
+            prompt: PromptSettings::default(),
             max_tokens: None,
             temperature: None,
             serve: ServeConfig::default(),
@@ -241,6 +268,8 @@ struct FileConfig {
     default_provider: Option<String>,
     model: Option<String>,
     system_prompt: Option<String>,
+    system_prompt_append: Option<String>,
+    prompt: Option<FilePrompt>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     serve: Option<FileServe>,
@@ -311,6 +340,17 @@ struct FileServe {
 #[serde(deny_unknown_fields)]
 struct FileUi {
     theme: Option<ThemeName>,
+}
+
+/// `[prompt]` in a file: the section switches, each optional.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePrompt {
+    agents_md: Option<bool>,
+    skills: Option<bool>,
+    tasks: Option<bool>,
+    subagents: Option<bool>,
+    sandbox: Option<bool>,
 }
 
 /// One provider entry in a file. An entry for a configured provider overrides only the fields
@@ -423,6 +463,26 @@ impl Config {
         }
         if let Some(system_prompt) = file.system_prompt {
             self.system_prompt = Some(system_prompt);
+        }
+        if let Some(system_prompt_append) = file.system_prompt_append {
+            self.system_prompt_append = Some(system_prompt_append);
+        }
+        if let Some(prompt) = file.prompt {
+            if let Some(value) = prompt.agents_md {
+                self.prompt.agents_md = value;
+            }
+            if let Some(value) = prompt.skills {
+                self.prompt.skills = value;
+            }
+            if let Some(value) = prompt.tasks {
+                self.prompt.tasks = value;
+            }
+            if let Some(value) = prompt.subagents {
+                self.prompt.subagents = value;
+            }
+            if let Some(value) = prompt.sandbox {
+                self.prompt.sandbox = value;
+            }
         }
         if let Some(max_tokens) = file.max_tokens {
             self.max_tokens = Some(max_tokens);
@@ -1361,10 +1421,34 @@ mod tests {
             "{prompt}"
         );
         assert!(!prompt.contains("You are hax"), "{prompt}");
+        assert!(prompt.contains("`read_file`"), "{prompt}");
+        assert!(!prompt.contains("To delegate work"), "{prompt}");
 
         with_config("prompt", "system_prompt = \"custom\"\n", |cfg| {
             assert_eq!(cfg.system_prompt.as_deref(), Some("custom"));
         });
+    }
+
+    #[test]
+    fn prompt_sections_are_configurable() {
+        with_config(
+            "prompt-sections",
+            "system_prompt_append = \"extra rules\"\n\
+             [prompt]\n\
+             agents_md = false\n\
+             skills = false\n\
+             tasks = false\n\
+             subagents = false\n\
+             sandbox = false\n",
+            |cfg| {
+                assert_eq!(cfg.system_prompt_append.as_deref(), Some("extra rules"));
+                assert!(!cfg.prompt.agents_md);
+                assert!(!cfg.prompt.skills);
+                assert!(!cfg.prompt.tasks);
+                assert!(!cfg.prompt.subagents);
+                assert!(!cfg.prompt.sandbox);
+            },
+        );
     }
 
     #[test]

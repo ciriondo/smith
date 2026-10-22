@@ -233,11 +233,37 @@ its key, and its advertised models (`*` marks the default).
 
 ### Setting a system prompt
 
-smith has a built-in system prompt. `--system` replaces it for the run.
+smith has a built-in system prompt. `--system` replaces the base prompt for the run; the
+procedural sections described below are still appended.
 
 ```sh
 smith --system "Answer only in JSON." -p "List three colours."
 ```
+
+`system_prompt_append` adds rules after the base prompt without replacing it. The
+`[prompt]` switches turn individual sections off.
+
+### System prompt composition
+
+smith sends the base prompt followed by these sections, in order:
+
+1. `system_prompt_append`, when set.
+2. `# Background tasks`: how a `run_shell` background task behaves and how `tool_wait`
+   collects or kills it.
+3. `# Subagents`: how to run `smith -p` through `run_shell`, and when to use `background`.
+4. `# Sandbox`: working directory, home directory, operating system, command shell, model,
+   git repository root, network state, the commands the image provides and the replacements
+   worth preferring when both commands exist.
+5. `# Project Context`: `$XDG_CONFIG_HOME/smith/AGENTS.md`, then `AGENTS.md` from the
+   repository root down to the workspace. Each file is capped at 64 KiB and marked
+   `[truncated]` when cut. The section states that it overrides the assistant defaults.
+6. `# Skills`: `SKILL.md` descriptions from project `.agents/skills` directories, then
+   `$XDG_CONFIG_HOME/smith/skills` and `~/.agents/skills`. The listing gives the name,
+   description and path; the model reads the body with `read_file`.
+
+The skills roots outside the workspace are mounted read-only when the skills section is
+enabled, so the listed paths are readable inside the sandbox. Empty sections are omitted. The
+`[prompt]` table and the order are described under configuration.
 
 ## Sandbox
 
@@ -256,7 +282,9 @@ start, the turn fails and smith prints why.
   per-container `SMITH_SANDBOX_TOKEN`. It does not contain the provider key. The image's
   `/etc/smith/config.toml` defines the `sandbox` provider.
 - The root filesystem is read-only, `/tmp` is a tmpfs, the workspace is mounted at its own
-  path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`.
+  path, and the caches live under `~/.local/share/smith/cache/{cargo,npm,pip}`. Existing
+  `$XDG_CONFIG_HOME/smith/skills` and `~/.agents/skills` directories are mounted read-only at
+  their own paths when `prompt.skills` is enabled.
 - The environment is computed rather than inherited. Values travel over the channel and never
   appear in the container's command line.
 - The base image ships inside the `smith` binary as a compressed docker archive and is loaded
@@ -358,7 +386,8 @@ smith rejects unknown fields, so a typo is an error rather than a setting that d
 
 ```
 unknown field `temperatur`, expected one of `default_provider`, `model`, `system_prompt`,
-`max_tokens`, `temperature`, `serve`, `ui`, `project`, `sandbox`, `policy`, `providers`
+`system_prompt_append`, `prompt`, `max_tokens`, `temperature`, `serve`, `ui`, `project`,
+`sandbox`, `policy`, `providers`
 ```
 
 Every top-level key is optional:
@@ -367,7 +396,13 @@ Every top-level key is optional:
 |---|---|
 | `default_provider` | Provider used when a model is addressed without a `provider/` prefix |
 | `model` | `provider/model`, or a bare id resolved against `default_provider` |
-| `system_prompt` | Replaces the built-in system prompt for every session |
+| `system_prompt` | Replaces the built-in base prompt for every session |
+| `system_prompt_append` | Appended after the base prompt and before the procedural sections |
+| `prompt.agents_md` | Include `# Project Context`. Default `true` |
+| `prompt.skills` | Include `# Skills` and mount the global skill roots. Default `true` |
+| `prompt.tasks` | Include `# Background tasks`. Default `true` |
+| `prompt.subagents` | Include `# Subagents`. Default `true` |
+| `prompt.sandbox` | Include `# Sandbox`. Default `true` |
 | `max_tokens`, `temperature` | Passed through to the provider |
 | `serve.bind`, `serve.port` | What `smith serve` binds when `--bind` or `--port` are not given. `bind` must be loopback |
 | `ui.theme` | Terminal theme: `auto`, `dark`, `light`, `ansi` or `off`. Default `auto` |
@@ -527,7 +562,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 235 offline tests; no network, no API key needed
+cargo test                        # 246 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

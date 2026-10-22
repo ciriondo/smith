@@ -27,9 +27,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{run_agent, AgentError, AgentEvent, AgentOutcome, PauseToken, ToolArgError};
+use crate::agent::{
+    run_agent, AgentError, AgentEvent, AgentOutcome, PauseToken, ToolArgError, TurnContext,
+};
 use crate::error::SmithError;
 use crate::message::{Message, Usage};
+use crate::prompt::PromptParts;
 use crate::provider::{ChatRequest, Provider, ProviderEvent};
 use crate::tools::{Tool, ToolDisplay};
 
@@ -327,6 +330,7 @@ pub struct SessionConfig {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub system: Option<String>,
+    pub prompt: PromptParts,
     pub tools: ToolSet,
     /// Canonical workspace root. Every tool call receives it.
     pub workspace: PathBuf,
@@ -446,6 +450,7 @@ impl SessionManager {
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
             system: self.config.system.clone(),
+            prompt: self.config.prompt.clone(),
             tools,
             workspace: self.config.workspace.clone(),
             max_tokens: self.config.max_tokens,
@@ -490,6 +495,7 @@ struct Actor {
     provider: Arc<dyn Provider>,
     model: String,
     system: Option<String>,
+    prompt: PromptParts,
     tools: Vec<Arc<dyn Tool>>,
     workspace: PathBuf,
     max_tokens: Option<u32>,
@@ -551,6 +557,7 @@ impl Actor {
         let tools = self.tools.clone();
         let workspace = self.workspace.clone();
         let pause = self.pause.clone();
+        let prompt_parts = self.prompt.clone();
         tokio::spawn(async move {
             let mut forward = |event: AgentEvent| {
                 let _ = ev_tx.send(event);
@@ -558,7 +565,10 @@ impl Actor {
             let result = run_agent(
                 provider.as_ref(),
                 &tools,
-                &workspace,
+                TurnContext {
+                    workspace: &workspace,
+                    prompt: &prompt_parts,
+                },
                 request,
                 pause,
                 cancel,
@@ -745,6 +755,7 @@ mod tests {
             provider: provider.clone(),
             model: "mock-1".to_string(),
             system: Some("be brief".to_string()),
+            prompt: PromptParts::none(),
             tools: Vec::new().into(),
             workspace: std::env::temp_dir(),
             max_tokens: None,
@@ -761,6 +772,7 @@ mod tests {
             provider,
             model: "mock-1".to_string(),
             system: Some("be brief".to_string()),
+            prompt: PromptParts::none(),
             tools: tools.into(),
             workspace: std::env::temp_dir(),
             max_tokens: None,
@@ -1437,11 +1449,40 @@ mod tests {
     async fn repeated_tool_prompt_fragments_are_appended_once() {
         let provider = Arc::new(MockProvider::new("mock"));
         provider.push_text("ok");
-        let first =
-            Arc::new(MockTool::new("first", "{}").with_prepare("The sandbox provides: bash."));
-        let second =
-            Arc::new(MockTool::new("second", "{}").with_prepare("The sandbox provides: bash."));
-        let manager = manager_with_tools(provider.clone(), vec![first, second]);
+        let fragment = "Available commands: bash.";
+        let first = Arc::new(MockTool::new("first", "{}").with_prepare(fragment));
+        let second = Arc::new(MockTool::new("second", "{}").with_prepare(fragment));
+        let workspace = std::env::temp_dir();
+        let mut config = crate::config::Config::default();
+        config.prompt = crate::config::PromptSettings {
+            agents_md: false,
+            skills: false,
+            tasks: false,
+            subagents: false,
+            sandbox: true,
+        };
+        let prompt = PromptParts::build(
+            &config,
+            &workspace,
+            &crate::prompt::PromptPaths::default(),
+            crate::prompt::SandboxFacts {
+                workspace: workspace.clone(),
+                home: crate::prompt::SANDBOX_HOME.to_string(),
+                os: "Debian 13.7".to_string(),
+                shell: crate::prompt::SANDBOX_SHELL.to_string(),
+                network: "disabled".to_string(),
+            },
+        );
+        let manager = SessionManager::new(SessionConfig {
+            provider: provider.clone(),
+            model: "mock-1".to_string(),
+            system: Some("be brief".to_string()),
+            prompt,
+            tools: vec![first as Arc<dyn Tool>, second as Arc<dyn Tool>].into(),
+            workspace,
+            max_tokens: None,
+            temperature: None,
+        });
         let session = manager.create();
         let mut sub = session.subscribe();
 
@@ -1452,13 +1493,17 @@ mod tests {
         let requests = provider.requests();
         let system = requests[0].system.as_deref().expect("a system message");
         assert_eq!(
-            system.matches("The sandbox provides: bash.").count(),
+            system.matches(fragment).count(),
             1,
             "the shared inventory fragment appears once: {system}"
         );
         assert!(
-            system.starts_with("be brief\n\nThe sandbox provides"),
-            "the fragment is its own section: {system}"
+            system.starts_with("be brief\n\n# Sandbox"),
+            "the fragment is inside the sandbox section: {system}"
+        );
+        assert!(
+            system.find(fragment) > system.find("# Sandbox"),
+            "the fragment follows the environment lines: {system}"
         );
     }
 

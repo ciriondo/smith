@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use smith_core::config::Config;
+use smith_core::config::{Config, NetworkEntry};
+use smith_core::prompt::{PromptParts, PromptPaths, SandboxFacts, SANDBOX_HOME, SANDBOX_SHELL};
 use smith_core::session::{
     SessionConfig, SessionHandle, SessionManager, SubError, Subscription, ToolSet,
 };
@@ -244,6 +245,15 @@ async fn run(cli: Cli) -> ExitCode {
     }
 }
 
+/// The network status the sandbox section reports.
+fn network_summary(allow: &[NetworkEntry]) -> String {
+    if allow.is_empty() {
+        return "disabled".to_string();
+    }
+    let entries: Vec<String> = allow.iter().map(ToString::to_string).collect();
+    format!("allowlist: {}", entries.join(", "))
+}
+
 /// Resolve the provider, model and system prompt into a `SessionManager`.
 fn build_manager(
     config: &Config,
@@ -262,12 +272,29 @@ fn build_manager(
     let workspace = std::env::current_dir()
         .map_err(|e| SmithError::Config(format!("cannot resolve the workspace: {e}")))?;
 
+    let paths = PromptPaths::from_env();
+    let mut settings = config.sandbox.clone();
+    if config.prompt.skills {
+        for root in smith_core::prompt::global_skill_roots(&paths) {
+            if root.exists() && !settings.ro_mounts.contains(&root) {
+                settings.ro_mounts.push(root);
+            }
+        }
+    }
+    let facts = SandboxFacts {
+        workspace: workspace.clone(),
+        home: SANDBOX_HOME.to_string(),
+        os: smith_sandbox::image::BASE_OS.to_string(),
+        shell: SANDBOX_SHELL.to_string(),
+        network: network_summary(&settings.allow),
+    };
+    let prompt = PromptParts::build(config, &workspace, &paths, facts);
+
     let tools = match tool_sandbox {
         ToolSandbox::Container => {
             let supervisor = Arc::new(
                 smith_sandbox::Supervisor::new().map_err(|e| SmithError::Config(e.to_string()))?,
             );
-            let settings = config.sandbox.clone();
             let sandbox_workspace = workspace.clone();
             let provider_id = model.provider.clone();
             let provider_cfg = provider_cfg.clone();
@@ -311,6 +338,7 @@ fn build_manager(
         provider,
         model: model.model,
         system: system_flag.or_else(|| config.system_prompt.clone()),
+        prompt,
         tools,
         workspace,
         max_tokens: config.max_tokens,
@@ -957,6 +985,7 @@ mod tests {
             provider,
             model: "mock-1".to_string(),
             system: None,
+            prompt: PromptParts::none(),
             tools: Vec::new().into(),
             workspace: std::env::temp_dir(),
             max_tokens: None,
@@ -970,6 +999,7 @@ mod tests {
             provider,
             model: "mock-1".to_string(),
             system: None,
+            prompt: PromptParts::none(),
             tools: tools.into(),
             workspace: std::env::temp_dir(),
             max_tokens: None,

@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod message;
 pub mod mock;
+pub mod prompt;
 pub mod provider;
 pub mod session;
 pub mod tools;

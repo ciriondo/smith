@@ -18,6 +18,10 @@ use crate::supervisor::Supervisor;
 /// (glibc 2.41) and pinned by digest; `assets/README.md` records the digest and the command.
 pub const BASE_TAG: &str = "localhost/smith-base:debian-13.7";
 
+/// The operating system inside the base image. The sandbox section of the system prompt
+/// reports it, so a user-facing claim about the tool environment has one source.
+pub const BASE_OS: &str = "Debian 13.7";
+
 /// The compressed docker archive of the base image. It is generated with `podman save` and
 /// embedded, so the sandbox start does not pull a base image from a registry.
 pub const BASE_ARCHIVE: &[u8] = include_bytes!("../assets/debian-slim.tar.gz");

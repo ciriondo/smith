@@ -111,6 +111,32 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// The line a tool contributes to the sandbox section.
+///
+/// The inventory lists the binaries the image provides. The replacement guidance follows hax:
+/// it is added only when both commands are present, so the model is not told to prefer a tool
+/// the image lacks.
+pub fn inventory_sentence(inventory: &[String]) -> Option<String> {
+    if inventory.is_empty() {
+        return None;
+    }
+    let mut sentence = format!("Available commands: {}.", inventory.join(", "));
+    let replacements = [("rg", "grep -r"), ("fd", "find"), ("python3", "python")];
+    let preferences: Vec<String> = replacements
+        .iter()
+        .filter(|(available, _)| inventory.iter().any(|name| name == available))
+        .filter(|(_, replaced)| {
+            let command = replaced.split_whitespace().next().unwrap_or_default();
+            inventory.iter().any(|name| name == command)
+        })
+        .map(|(available, replaced)| format!("`{available}` to `{replaced}`"))
+        .collect();
+    if !preferences.is_empty() {
+        sentence.push_str(&format!("\nPrefer {}.", preferences.join(", ")));
+    }
+    Some(sentence)
+}
+
 /// The specs of all five tools, in a stable order.
 pub fn specs() -> Vec<ToolSpec> {
     TOOL_NAMES.iter().filter_map(|name| spec(name)).collect()
@@ -479,6 +505,27 @@ mod tests {
         assert_eq!(wait.schema["required"], json!(["id"]));
         let shell = spec("run_shell").expect("run_shell");
         assert_eq!(shell.schema["properties"]["background"]["type"], "boolean");
+    }
+
+    #[test]
+    fn the_inventory_prefers_replacements_only_when_both_exist() {
+        let inventory: Vec<String> = ["bash", "grep", "rg", "find", "fd", "python", "python3"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let sentence = inventory_sentence(&inventory).unwrap();
+        assert!(
+            sentence.starts_with("Available commands: bash, grep, rg, find, fd, python, python3."),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("Prefer `rg` to `grep -r`, `fd` to `find`, `python3` to `python`."),
+            "{sentence}"
+        );
+
+        let partial = inventory_sentence(&["rg".to_string()]).unwrap();
+        assert!(!partial.contains("Prefer"), "{partial}");
+        assert_eq!(inventory_sentence(&[]), None);
     }
 
     #[test]

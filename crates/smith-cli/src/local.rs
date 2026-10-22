@@ -48,14 +48,7 @@ pub fn local_tools(workspace: &Path) -> Result<Vec<Arc<dyn Tool>>, SmithError> {
 
 fn inventory_sentence() -> Option<String> {
     let inventory = read_inventory(Path::new(INVENTORY_PATH)).ok()?;
-    if inventory.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "The sandbox image provides: {}.",
-            inventory.join(", ")
-        ))
-    }
+    smith_core::tools::inventory_sentence(&inventory)
 }
 
 struct LocalTool {

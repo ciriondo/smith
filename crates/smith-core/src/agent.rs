@@ -251,6 +251,14 @@ pub struct AgentOutcome {
     pub paused: bool,
 }
 
+/// The session-owned inputs a turn composes its request from.
+pub struct TurnContext<'a> {
+    /// Canonical workspace root handed to every tool call.
+    pub workspace: &'a Path,
+    /// The static system prompt parts. The sandbox fragment is added during the turn.
+    pub prompt: &'a crate::prompt::PromptParts,
+}
+
 /// Run a whole turn: call the provider, execute the tool calls it asks for, and repeat until
 /// it answers without any.
 ///
@@ -258,7 +266,7 @@ pub struct AgentOutcome {
 pub async fn run_agent(
     provider: &dyn Provider,
     tools: &[Arc<dyn Tool>],
-    workspace: &Path,
+    context: TurnContext<'_>,
     mut request: ChatRequest,
     pause: PauseToken,
     cancel: CancellationToken,
@@ -271,15 +279,14 @@ pub async fn run_agent(
     let mut usage = Usage::default();
     let mut tool_arg_errors = Vec::new();
 
-    let mut system = request.system.clone().unwrap_or_default();
-    let mut sections: Vec<String> = Vec::new();
+    let mut fragments: Vec<String> = Vec::new();
     for tool in tools {
         match tool.prepare().await {
-            Ok(Some(sentence)) => {
-                // The sandbox tools share one handle and therefore return the same inventory
-                // sentence. Append each distinct fragment once, as its own section.
-                if !sections.iter().any(|existing| existing == &sentence) {
-                    sections.push(sentence);
+            Ok(Some(fragment)) => {
+                // The sandbox tools share one handle and therefore return the same inventory.
+                // Place each distinct fragment once, inside the sandbox section.
+                if !fragments.iter().any(|existing| existing == &fragment) {
+                    fragments.push(fragment);
                 }
             }
             Ok(None) => {}
@@ -289,17 +296,9 @@ pub async fn run_agent(
             }
         }
     }
-    for section in sections {
-        if !system.is_empty() {
-            system.push_str("\n\n");
-        }
-        system.push_str(&section);
-    }
-    request.system = if system.is_empty() {
-        None
-    } else {
-        Some(system)
-    };
+    request.system = context
+        .prompt
+        .compose(request.system.as_deref(), &request.model, &fragments);
     request.tools = tools.iter().map(|tool| tool.spec()).collect();
 
     loop {
@@ -372,11 +371,11 @@ pub async fn run_agent(
                     "tool arguments did not parse".to_string(),
                 ))
             } else if let Some(tool) = tool {
-                let context = ToolContext {
-                    workspace: workspace.to_path_buf(),
+                let tool_context = ToolContext {
+                    workspace: context.workspace.to_path_buf(),
                     cancel: cancel.clone(),
                 };
-                tool.call(args, &context).await
+                tool.call(args, &tool_context).await
             } else {
                 let available: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
                 Err(ToolError::Message(format!(
@@ -603,7 +602,10 @@ mod tests {
         let outcome = run_agent(
             &provider,
             &[tool],
-            Path::new("."),
+            TurnContext {
+                workspace: Path::new("."),
+                prompt: &crate::prompt::PromptParts::none(),
+            },
             request,
             PauseToken::default(),
             CancellationToken::new(),
@@ -634,7 +636,10 @@ mod tests {
         let outcome = run_agent(
             &provider,
             &[],
-            Path::new("."),
+            TurnContext {
+                workspace: Path::new("."),
+                prompt: &crate::prompt::PromptParts::none(),
+            },
             request,
             pause,
             CancellationToken::new(),
