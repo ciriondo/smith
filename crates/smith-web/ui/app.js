@@ -85,6 +85,36 @@ function addNote(text) {
   item.scrollIntoView({ block: "end" });
 }
 
+function renderToolDisplay(display) {
+  if (!display || display.kind === "collapsed") return;
+  const item = document.createElement("li");
+  item.className = "tool-output";
+  const addRow = (text, className) => {
+    const row = document.createElement("div");
+    row.className = "tool-row" + (className ? " " + className : "");
+    row.textContent = text;
+    item.appendChild(row);
+  };
+  const head = display.kind === "head_tail" ? display.head || [] : display.lines || [];
+  for (const line of head) {
+    const className =
+      display.kind === "diff"
+        ? line.startsWith("+")
+          ? "diff-add"
+          : line.startsWith("-")
+            ? "diff-remove"
+            : ""
+        : "";
+    addRow(line, className);
+  }
+  if (display.omitted) addRow(`... (${display.omitted} more lines) ...`, "tool-elided");
+  if (display.kind === "head_tail") {
+    for (const line of display.tail || []) addRow(line);
+  }
+  transcript.appendChild(item);
+  item.scrollIntoView({ block: "end" });
+}
+
 function renderTranscript(messages) {
   transcript.replaceChildren();
   for (const message of messages) {
@@ -280,6 +310,7 @@ function apply(frame) {
       break;
     case "tool_finished":
       addNote(`tool ${payload.name}: ${payload.summary} (${payload.duration_ms} ms)`);
+      renderToolDisplay(payload.display);
       break;
     case "turn_failed":
       setBusy(false);

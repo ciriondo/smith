@@ -19,7 +19,7 @@ use smith_core::config::Config;
 use smith_core::session::{
     SessionConfig, SessionHandle, SessionManager, SubError, Subscription, ToolSet,
 };
-use smith_core::{SmithError, UiEventKind};
+use smith_core::{SmithError, ToolDisplay, UiEventKind};
 
 /// Exit codes. `-p` mode is used by scripts, so these values are part of the contract.
 const EXIT_OK: u8 = 0;
@@ -652,19 +652,46 @@ async fn render_turn<W: Write, E: Write>(
                     "smith: another frontend sent {rejected:?} while a turn was running"
                 );
             }
-            // The started line is redundant in a terminal: the finished line names the tool
-            // and its outcome. Both modes therefore print one line per call, to stderr.
-            UiEventKind::ToolStarted { .. } => {}
+            // The call header, then its bounded output block and the outcome. The model
+            // reply stays on stdout; all of this is diagnostics.
+            UiEventKind::ToolStarted { summary, .. } => {
+                let _ = writeln!(err, "smith: {summary}");
+            }
             UiEventKind::ToolFinished {
-                name,
                 duration_ms,
                 summary,
+                display,
                 ..
             } => {
-                let _ = writeln!(err, "smith: {name}: {summary} ({duration_ms} ms)");
+                write_display(err, &display);
+                let _ = writeln!(err, "  └ {summary} ({duration_ms} ms)");
             }
             UiEventKind::TurnStarted { .. } | UiEventKind::Usage { .. } => {}
         }
+    }
+}
+
+/// Print a finished tool's preview rows. The first row shares the call header; the last row
+/// shares the outcome line, so the block is one visual unit.
+fn write_display<W: Write>(err: &mut W, display: &ToolDisplay) {
+    let (head, tail, omitted): (&[String], &[String], usize) = match display {
+        ToolDisplay::Collapsed => return,
+        ToolDisplay::Head { lines, omitted } => (lines, &[], *omitted),
+        ToolDisplay::HeadTail {
+            head,
+            tail,
+            omitted,
+        } => (head, tail, *omitted),
+        ToolDisplay::Diff { lines, omitted } => (lines, &[], *omitted),
+    };
+    for line in head {
+        let _ = writeln!(err, "  │ {line}");
+    }
+    if omitted > 0 {
+        let _ = writeln!(err, "  │ ... ({omitted} more lines) ...");
+    }
+    for line in tail {
+        let _ = writeln!(err, "  │ {line}");
     }
 }
 
@@ -776,7 +803,7 @@ mod tests {
 
     use smith_core::message::StopReason;
     use smith_core::message::Usage;
-    use smith_core::mock::MockProvider;
+    use smith_core::mock::{MockProvider, MockTool};
     use smith_core::provider::ProviderEvent;
     use smith_core::{Tool, ToolContext, ToolError, ToolSpec};
     use tokio::sync::Semaphore;
@@ -1139,6 +1166,101 @@ mod tests {
             err.contains("unparseable arguments for read_file"),
             "the loop reports what the model got wrong: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_finished_shell_tool_prints_its_output_block() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("run_shell".to_string()),
+                args_delta: r#"{"command":"echo hi"}"#.to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let result = serde_json::json!({
+            "exit_code": 0, "stdout": "one\n", "stderr": "bad\n",
+            "truncated": false, "timed_out": false, "cancelled": false, "running": false
+        })
+        .to_string();
+        let tool = Arc::new(MockTool::new("run_shell", result));
+        let session = session_with_tools(provider, vec![tool as Arc<dyn Tool>]);
+        let mut subscription = session.subscribe();
+
+        let (code, out, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "done\n");
+        assert!(err.contains("smith: run_shell echo hi"), "{err}");
+        assert!(err.contains("  │ one"), "{err}");
+        assert!(err.contains("  │ ! bad"), "{err}");
+        assert!(err.contains("  └ exit 0 ("), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_finished_edit_prints_a_diff_block() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("edit_file".to_string()),
+                args_delta: r#"{"path":"src/a.rs","old_string":"old","new_string":"new"}"#
+                    .to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let result = serde_json::json!({"path": "src/a.rs", "replacements": 1}).to_string();
+        let tool = Arc::new(MockTool::new("edit_file", result));
+        let session = session_with_tools(provider, vec![tool as Arc<dyn Tool>]);
+        let mut subscription = session.subscribe();
+
+        let (code, _, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert!(err.contains("smith: edit_file src/a.rs"), "{err}");
+        assert!(err.contains("  │ -old"), "{err}");
+        assert!(err.contains("  │ +new"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_read_is_collapsed_to_the_call_and_outcome() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("read_file".to_string()),
+                args_delta: r#"{"path":"src/a.rs"}"#.to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+        let result = serde_json::json!({
+            "path": "src/a.rs", "start_line": 1, "end_line": 1,
+            "total_lines": 1, "truncated": false, "content": "secret\n"
+        })
+        .to_string();
+        let tool = Arc::new(MockTool::new("read_file", result));
+        let session = session_with_tools(provider, vec![tool as Arc<dyn Tool>]);
+        let mut subscription = session.subscribe();
+
+        let (code, _, err) = run_turn_rendered(&session, &mut subscription, false, None).await;
+        assert_eq!(code, EXIT_OK);
+        assert!(err.contains("smith: read_file src/a.rs"), "{err}");
+        assert!(
+            !err.contains("  │"),
+            "a read must not print its content: {err}"
+        );
+        assert!(err.contains("  └ ok ("), "{err}");
     }
 
     #[tokio::test]

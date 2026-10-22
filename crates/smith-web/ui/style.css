@@ -112,3 +112,17 @@ button:disabled { opacity: 0.4; cursor: default; }
 .status.warn { color: var(--warn); }
 .status.error { color: var(--error); }
 .muted { color: var(--dim); }
+
+.tool-output {
+  margin: 0 0 0.75rem 0;
+  padding: 0.25rem 0.5rem;
+  border-left: 2px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.tool-row { color: var(--dim); }
+.tool-row.diff-add { color: var(--accent); }
+.tool-row.diff-remove { color: var(--error); }
+.tool-row.tool-elided { color: var(--dim); }

@@ -1009,4 +1009,6 @@ async fn tool_events_are_streamed() {
     let finished = frames.find("event: tool_finished").expect("tool_finished");
     assert!(started < finished, "the events must stay in order");
     assert!(frames.contains("read_file"), "{frames}");
+    assert!(frames.contains("\"display\""), "{frames}");
+    assert!(frames.contains("\"kind\":\"collapsed\""), "{frames}");
 }

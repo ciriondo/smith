@@ -30,7 +30,7 @@ use crate::agent::{run_agent, AgentError, AgentEvent, AgentOutcome, PauseToken, 
 use crate::error::SmithError;
 use crate::message::{Message, Usage};
 use crate::provider::{ChatRequest, Provider, ProviderEvent};
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolDisplay};
 
 /// Replay buffer cap per session. A reconnecting client can resume from this buffer.
 const BACKLOG_CAP: usize = 1000;
@@ -191,6 +191,7 @@ pub enum UiEventKind {
         duration_ms: u64,
         truncated: bool,
         summary: String,
+        display: ToolDisplay,
     },
 }
 
@@ -691,6 +692,7 @@ impl Actor {
                 duration_ms,
                 truncated,
                 summary,
+                display,
             } => self.emit(UiEventKind::ToolFinished {
                 call_id: call_id.clone(),
                 name: name.clone(),
@@ -698,6 +700,7 @@ impl Actor {
                 duration_ms: *duration_ms,
                 truncated: *truncated,
                 summary: summary.clone(),
+                display: display.clone(),
             }),
         }
     }
@@ -762,6 +765,49 @@ mod tests {
             max_tokens: None,
             temperature: None,
         })
+    }
+
+    #[tokio::test]
+    async fn a_finished_tool_event_carries_its_display() {
+        let provider = Arc::new(MockProvider::new("mock"));
+        provider.push_events(vec![
+            ProviderEvent::ToolCallDelta {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("run_shell".to_string()),
+                args_delta: "{\"command\":\"echo one\"}".to_string(),
+            },
+            ProviderEvent::Done {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        provider.push_text("done");
+
+        let result = serde_json::json!({
+            "exit_code": 0, "stdout": "one\n", "stderr": "",
+            "truncated": false, "timed_out": false, "cancelled": false, "running": false
+        })
+        .to_string();
+        let mock = Arc::new(MockTool::new("run_shell", result));
+        let manager = manager_with_tools(provider.clone(), vec![mock as Arc<dyn Tool>]);
+        let session = manager.create();
+        let mut subscription = session.subscribe();
+
+        session.send("run it").await.unwrap();
+        let (seen, terminal) = drain_until_terminal(&mut subscription).await;
+        assert!(matches!(terminal.kind, UiEventKind::TurnFinished { .. }));
+
+        let display = seen
+            .iter()
+            .find_map(|event| match &event.kind {
+                UiEventKind::ToolFinished { display, .. } => Some(display.clone()),
+                _ => None,
+            })
+            .expect("a tool_finished event");
+        match display {
+            ToolDisplay::HeadTail { head, .. } => assert_eq!(head, vec!["one".to_string()]),
+            other => panic!("unexpected display: {other:?}"),
+        }
     }
 
     #[tokio::test]

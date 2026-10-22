@@ -24,4 +24,4 @@ pub use session::{
     Command, SessionConfig, SessionHandle, SessionId, SessionManager, SessionSnapshot, ToolSet,
     UiEvent, UiEventKind,
 };
-pub use tools::{Tool, ToolContext, ToolError};
+pub use tools::{Tool, ToolContext, ToolDisplay, ToolError};

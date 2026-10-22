@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::ProviderError;
 use crate::message::{ContentBlock, Message, Role, StopReason, Usage};
 use crate::provider::{ChatRequest, Provider, ProviderEvent, ProviderStream};
-use crate::tools::{summarize_call, summarize_result, Tool, ToolContext, ToolError};
+use crate::tools::{
+    failure_display, summarize_call, summarize_result, Tool, ToolContext, ToolDisplay, ToolError,
+};
 
 /// A tool call assembled from stream fragments.
 #[derive(Debug, Default)]
@@ -197,6 +199,7 @@ pub enum AgentEvent {
         duration_ms: u64,
         truncated: bool,
         summary: String,
+        display: ToolDisplay,
     },
 }
 
@@ -358,13 +361,15 @@ pub async fn run_agent(
             });
             let started = Instant::now();
 
+            let tool = tools.iter().find(|tool| tool.spec().name == name);
+            let display_args = tool.and_then(|tool| tool.display_args(&args));
             let outcome = if args.is_null() {
                 // The accumulator recorded the parse error; answer it so the model can try
                 // again rather than leaving the call unanswered.
                 Err(ToolError::Message(
                     "tool arguments did not parse".to_string(),
                 ))
-            } else if let Some(tool) = tools.iter().find(|tool| tool.spec().name == name) {
+            } else if let Some(tool) = tool {
                 let context = ToolContext {
                     workspace: workspace.to_path_buf(),
                     cancel: cancel.clone(),
@@ -389,6 +394,13 @@ pub async fn run_agent(
                 }
             };
             let duration_ms = started.elapsed().as_millis() as u64;
+            let display = if !ok {
+                failure_display(&content)
+            } else {
+                display_args
+                    .or_else(|| tool.map(|tool| tool.display_result(&content)))
+                    .unwrap_or(ToolDisplay::Collapsed)
+            };
             emit(AgentEvent::ToolFinished {
                 call_id: call_id.clone(),
                 name: name.clone(),
@@ -396,6 +408,7 @@ pub async fn run_agent(
                 duration_ms,
                 truncated,
                 summary: summarize_result(&name, ok, truncated, &content),
+                display,
             });
 
             let message = Message {

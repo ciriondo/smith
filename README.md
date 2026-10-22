@@ -116,9 +116,24 @@ message steers the model from that point. Esc again terminates the turn immediat
 terminates. Termination drops the turn from the transcript, so the model does not see a partial
 answer; a paused turn keeps the steps that completed. The startup line names both shortcuts.
 
-Two kinds of output go to stderr, so stdout contains only the reply:
+Three kinds of output go to stderr, so stdout contains only the reply:
 - `--show-reasoning` prints reasoning tokens, dimmed, for models that emit them.
 - A token-usage line after each turn, for example `smith: 19 in / 17 out tokens`.
+- A tool block after each call. The call summary is one line, the preview is bounded and the
+  outcome closes the block:
+
+```
+smith: run_shell cargo test
+  │ test result: ok. 42 passed
+  │ ... (18 more lines) ...
+  └ exit 0 (412 ms)
+```
+
+Shell output shows a head and a tail with an omitted-line row. An `edit_file` call shows a
+diff with `-` and `+` rows. A `write_file` call shows the head of the content. A `read_file`
+call and a background start are collapsed to the call and outcome. The preview limits are 8
+head lines, 4 head plus 4 tail lines, and 400 characters per row. The block is settled when the
+tool finishes; there is no live update while it runs.
 
 ### Web UI (localhost only)
 
@@ -165,6 +180,10 @@ The client consumes the event stream as Server-Sent Events (SSE) with `fetch` an
 `ReadableStream`, not `EventSource`, because `EventSource` cannot set an `Authorization` header.
 Reconnection is manual. The client re-fetches the transcript and resumes from the last `seq` it
 saw, so the UI does not render a gap as a continuous conversation.
+
+The browser renders the same tool block as the terminal: the call summary, the bounded preview
+and the outcome. Diff rows use the add and remove colours; an omitted-lines row appears when
+the preview is capped. Reads and background starts are collapsed.
 
 The API is plain JSON for scripting:
 
@@ -478,7 +497,7 @@ three renderers over one session actor, not three implementations.
 ## Development
 
 ```sh
-cargo test                        # 205 offline tests; no network, no API key needed
+cargo test                        # 216 offline tests; no network, no API key needed
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

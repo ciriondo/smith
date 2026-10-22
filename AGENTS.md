@@ -160,9 +160,15 @@ Core boundaries:
 - The transcript is the model-visible conversation. Reasoning is not part of it.
   `ReasoningDelta` is a separate channel, hidden unless `--show-reasoning`, and never added to
   the transcript.
-- The CLI's reply goes to stdout. Diagnostics (reasoning, usage and errors) go to stderr. Exit
-  codes `0`, `1` and `130` are a scripting contract. `render_turn` takes generic writers so
-  tests can check output and codes byte for byte. Keep that signature.
+- The CLI's reply goes to stdout. Diagnostics (reasoning, usage, tool blocks and errors) go to
+  stderr. Exit codes `0`, `1` and `130` are a scripting contract. `render_turn` takes generic
+  writers so tests can check output and codes byte for byte. Keep that signature.
+- A finished tool emits its bounded `ToolDisplay` in `ToolFinished`: `Collapsed`, `Head`,
+  `HeadTail` or `Diff`. `smith-core/src/tools.rs` computes it from the call arguments before
+  the call and from the result after it; a failed call shows the error head. The CLI prints the
+  call summary, the display rows and the outcome to stderr. The web UI renders the same value.
+  Reads, background starts and unknown tools are collapsed. The preview is settled when the
+  tool finishes. Live streaming needs a new UI event and is not implemented.
 - Frontends subscribe before they take a snapshot and render only events with `seq` above the
   snapshot. With two frontends on one session, a reversed order drops turns or renders another
   frontend's reply as its own.
